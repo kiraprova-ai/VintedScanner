@@ -18,16 +18,16 @@ import requests
 
 import Config
 
-# Mappatura webhook dedicati per ciascun canale Discord
+# Mappatura webhook dedicati con i nuovi URL funzionanti per Scuffers e Deputy
 BRAND_WEBHOOKS = {
-    "scuffers": "https://discord.com/api/webhooks/1562768393575079946/6GGNmryFIWm8PHja91CXxBM2feYNZvr92JfbyoyrBV-3NjB8N6uw06OzXsSP6q84o1_b/slack",
+    "scuffers": "https://discord.com/api/webhooks/1562802268435382374/Byn_ZtsbWdD1o4Rh1a9acl_hcv2OtMlVJmKIQNPIIqtBje8gRRyvmiB305coxn6Mb0QL/slack",
     "reaven": "https://discord.com/api/webhooks/1562768580750090260/iDRYBS4r2RQO1K-ZnuYXVemKKT_zxcj16_lzRIrHFkz1yvmatF5o6C2gbzgEHsdDbszr/slack",
     "fivefourfive": "https://discord.com/api/webhooks/1562768783297216572/0ophTnzbWiBbzyqMXW41Tko5PlADLn3mN-_L7Ay0Rql9l_4QseNs24YhdC9tfq4sUAjc/slack",
     "corvidae": "https://discord.com/api/webhooks/1562768921059401732/174iHhaQSIea1PXB5Dt5bUDKv7HXRsaKPsvQyj0rKkIKheOIUg7nw_JTQ74199TL3GgT/slack",
     "perfect": "https://discord.com/api/webhooks/1562769028878176287/3Ts4QjnGuhNxoxPOUxcIXdXAO_JW30ewPPP8lEgmRU0T9XySCKm3RwC_ckMrfmf53c_R/slack",
     "ebtm": "https://discord.com/api/webhooks/1562769178195394694/tDN20DDfPNU3Y3Zm7pr0D5rBFEezct4o3u5z00E6iPprALzC4VtvbckV1P_V7owAzWOt/slack",
     "5mc2": "https://discord.com/api/webhooks/1562769327118094376/mjwFLPWjffWjI8Hm-33wXspwL6LoOlOy0ZdC6dnRqkV4zSjiZiOxrGSVQHorrIADGuRE/slack",
-    "deputy department": "https://discord.com/api/webhooks/1562769484433850388/uYWTKEiAWM0tdiaNBw0_cYHl0xCUDWgriQe-FVoOX4RB0gk7aOS6vngCwzvzxO42DvB2/slack",
+    "deputy department": "https://discord.com/api/webhooks/1562802075203666031/42k70jAGrUOC2DWdQC3wSV3DDmTNH8LHNntT-cqGUz6zOfdTt5Kl_-zPihH2-wKvVLkW/slack",
 }
 
 PROJECT_DIR = Path(__file__).resolve().parent
@@ -151,27 +151,34 @@ def send_slack_message(item_title, item_price, item_url, item_image, brand_title
 
     payload = {"text": "\n".join(message_lines)}
 
-    for attempt in range(4):
+    for attempt in range(2):
         try:
             response = requests.post(webhook_url, json=payload, timeout=REQUEST_TIMEOUT_SECONDS)
+
             if response.status_code == 429:
                 try:
                     data = response.json()
                     wait_time = float(data.get("retry_after", 3))
                 except Exception:
                     wait_time = float(response.headers.get("Retry-After", 3))
-                logging.warning("Discord Rate Limit su [%s]: attesa di %.2f sec (tentativo %d)...", matched_query, wait_time, attempt + 1)
-                time.sleep(wait_time + 1.0)
+
+                # Se Discord chiede oltre 5 secondi, salta per evitare blocchi dello script
+                if wait_time > 5.0:
+                    logging.warning("Discord Rate Limit prolungato su [%s] (%.1f sec). Messaggio saltato.", matched_query, wait_time)
+                    return False
+
+                logging.warning("Discord Rate Limit su [%s]: attesa di %.2f sec...", matched_query, wait_time)
+                time.sleep(wait_time + 0.5)
                 continue
 
             response.raise_for_status()
             logging.info("Discord inviato per [%s]: %s", matched_query, item_title)
-            time.sleep(2.0)  # Pausa conservativa tra un messaggio e l'altro
+            time.sleep(1.5)
             return True
 
         except requests.exceptions.RequestException as error:
             logging.error("Errore invio notifica Discord: %s", error)
-            time.sleep(2.0)
+            return False
 
     return False
 
@@ -217,19 +224,15 @@ def normalize_item(item):
 
 
 def is_relevant_item(normalized, query_text):
-    """Verifica severa: il termine deve essere nel brand o come parola intera nel titolo."""
     target = query_text.lower().strip()
     title = normalized["title"].lower()
     brand = normalized["brand"].lower().strip()
 
-    # Se il brand ufficiale coincide o contiene la query
     if target in brand:
         return True
 
-    # Se il brand è sconosciuto o generico, accetta solo se la parola è isolata nel titolo
     pattern = rf"\b{re.escape(target)}\b"
     if re.search(pattern, title):
-        # Esclude frasi comuni tipo 'perfect condition' o 'in perfect shape'
         if target == "perfect" and ("condition" in title or "stato" in title or "shape" in title or "condizioni" in title):
             return False
         return True
@@ -242,19 +245,15 @@ def process_item(item, analyzed_items, is_initial_run=False, matched_query=None)
     if not normalized or normalized["id"] in analyzed_items:
         return True
 
-    # Salva comunque l'ID nel database per non ricontrollarlo
     save_analyzed_item(normalized["id"])
     analyzed_items.add(normalized["id"])
 
-    # Scarta se non passa il filtro anti-spam
     if not is_relevant_item(normalized, matched_query):
         return True
 
-    # Se è il primo ciclo di avvio non inviare nulla
     if is_initial_run:
         return True
 
-    # Invia notifica per drop reale
     return send_slack_message(
         normalized["title"],
         normalized["price"],
@@ -321,3 +320,4 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
+
