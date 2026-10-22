@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Search Vinted and notify users about newly listed matching items in real time."""
 import argparse
+import datetime
 import email.utils
 import html
 import json
@@ -54,7 +55,6 @@ WEB_HEADERS = {
     "Cache-Control": "no-cache",
 }
 
-# Capi ammessi per la query "perfect"
 PAROLE_VESTITI = (
     "felpa", "felpe", "hoodie", "hoodies", "crewneck", "zip",
     "sweatshirt", "sweater", "maglia", "maglione", "maglietta",
@@ -62,7 +62,6 @@ PAROLE_VESTITI = (
     "tracksuit", "jogger", "jeans", "giacca", "giubbotto", "jacket"
 )
 
-# Termini non correlati da scartare immediatamente
 PAROLE_ESCLUSE = (
     "condition", "conditions", "condizioni", "condizione", "stato", "shape",
     "cd", "dvd", "vinile", "vinyl", "album", "disco", "musica", "music",
@@ -142,24 +141,37 @@ def save_analyzed_item(item_id, database_path=ITEMS_DATABASE_PATH):
         database.write(f"{item_id}\n")
 
 
-def send_discord_notification(item_title, item_price, item_url, item_image, brand_title=None, matched_query=None):
+def send_discord_notification(item_title, item_price, item_url, item_image, item_size="N/D", item_status="N/D", seller_info="N/D", brand_title=None, matched_query=None):
     webhook_url = BRAND_WEBHOOKS.get(str(matched_query).lower().strip())
     if not webhook_url:
         return True
 
     webhook_url = webhook_url.removesuffix("/slack")
-
     brand_display = brand_title if brand_title else matched_query
-    content = (
-        f"**{item_title}**\n"
-        f"🏷️ **Prezzo:** {item_price}\n"
-        f"👕 **Brand:** {brand_display}\n"
-        f"🔗 {item_url}"
-    )
-    if item_image:
-        content += f"\n{item_image}"
 
-    payload = {"content": content}
+    # Scheda completa con dettagli ordinati
+    embed = {
+        "title": item_title[:250],
+        "url": item_url,
+        "description": f"🛒 **[CLICCA QUI PER VEDERE O ACQUISTARE]({item_url})**",
+        "color": 0x09B1BA,
+        "fields": [
+            {"name": "🏷️ Prezzo", "value": f"**{item_price}**", "inline": True},
+            {"name": "📏 Taglia", "value": item_size, "inline": True},
+            {"name": "👕 Brand", "value": brand_display, "inline": True},
+            {"name": "✨ Condizioni", "value": item_status, "inline": True},
+            {"name": "👤 Venditore", "value": seller_info, "inline": True},
+        ],
+        "footer": {
+            "text": "Vinted Scanner • Drop in tempo reale"
+        },
+        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat()
+    }
+
+    # Se c'è l'immagine, la inviamo come content sopra la scheda per averla in cima
+    payload = {"embeds": [embed]}
+    if item_image:
+        payload["content"] = item_image
 
     for attempt in range(2):
         try:
@@ -221,11 +233,29 @@ def normalize_item(item):
     price = f"{amount} {currency}" if amount else "N/A"
     photo_data = item.get("photo") or {}
     brand_title = item.get("brand_title") or ""
+    size_title = item.get("size_title") or "N/D"
+    status = item.get("status") or "N/D"
+
+    user_data = item.get("user") or {}
+    seller_name = user_data.get("login") or "N/D"
+    feedback_count = user_data.get("feedback_count")
+    feedback_reputation = user_data.get("feedback_reputation")
+
+    if feedback_count is not None and feedback_reputation is not None:
+        rating = round(float(feedback_reputation) * 5, 1)
+        seller_display = f"{seller_name} ({rating}⭐ • {feedback_count})"
+    elif seller_name != "N/D":
+        seller_display = seller_name
+    else:
+        seller_display = "N/D"
 
     return {
         "id": str(item_id),
         "title": str(item_title),
         "brand": str(brand_title),
+        "size": str(size_title),
+        "status": str(status),
+        "seller": str(seller_display),
         "price": price,
         "url": full_url,
         "image": photo_data.get("full_size_url"),
@@ -237,7 +267,6 @@ def is_relevant_item(normalized, query_text):
     title = normalized["title"].lower().replace("ü", "u")
     brand = normalized["brand"].lower().strip().replace("ü", "u")
 
-    # 1. Logica specifica per Perfect
     if target == "perfect":
         if brand == "perfect":
             return True
@@ -250,11 +279,9 @@ def is_relevant_item(normalized, query_text):
         has_clothing_term = any(c in words or c in title for c in PAROLE_VESTITI)
         return has_perfect_word and has_clothing_term
 
-    # 2. Logica specifica per Stussy (cattura sia stussy che stüssy ovunque)
     if target in ("stussy", "stüssy"):
         return "stussy" in brand or bool(re.search(r"\bstussy\b", title))
 
-    # 3. Logica standard per tutti gli altri brand
     if target in brand:
         return True
 
@@ -277,10 +304,13 @@ def process_item(item, analyzed_items, is_initial_run=False, matched_query=None)
         return True
 
     return send_discord_notification(
-        normalized["title"],
-        normalized["price"],
-        normalized["url"],
-        normalized["image"],
+        item_title=normalized["title"],
+        item_price=normalized["price"],
+        item_url=normalized["url"],
+        item_image=normalized["image"],
+        item_size=normalized.get("size", "N/D"),
+        item_status=normalized.get("status", "N/D"),
+        seller_info=normalized.get("seller", "N/D"),
         brand_title=normalized["brand"],
         matched_query=matched_query,
     )
