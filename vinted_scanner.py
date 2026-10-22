@@ -1,285 +1,123 @@
-#!/usr/bin/env python3
-"""Search Vinted and notify users about newly listed matching items in real time."""
-import argparse
-import datetime
-import email.utils
-import html
-import json
-import logging
 import os
 import re
-import smtplib
-import sys
+import json
 import time
-from email.message import EmailMessage
-from logging.handlers import RotatingFileHandler
-from pathlib import Path
-from urllib.parse import urljoin, urlsplit, urlunsplit
-
+import random
+import logging
+from datetime import datetime, timezone
 import requests
 
-import Config
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
 
-# Caricamento sicuro dei webhook dalla variabile d'ambiente di Render
-raw_webhooks = os.environ.get("DISCORD_WEBHOOKS_JSON", "{}")
-try:
-    BRAND_WEBHOOKS = json.loads(raw_webhooks)
-except Exception:
-    BRAND_WEBHOOKS = {}
-
-PROJECT_DIR = Path(__file__).resolve().parent
-ITEMS_DATABASE_PATH = PROJECT_DIR / "vinted_items.txt"
-LOG_PATH = PROJECT_DIR / "vinted_scanner.log"
-REQUEST_TIMEOUT_SECONDS = 30
+# Costanti di navigazione e headers browser
+VINTED_BASE_URL = "https://www.vinted.it"
 CHECK_INTERVAL_SECONDS = 30
+
+PAROLE_ESCLUSE = {
+    "jacket", "giacca", "chaqueta", "blouson",
+    "fleece", "pile", "polar", "forro",
+    "cap", "hat", "gorro", "gorra", "cappello", "berretto", "beanie",
+    "gloves", "guanti", "guantes", "gants",
+    "scarf", "sciarpa", "bufanda", "echarpe"
+}
+
+PAROLE_VESTITI = {
+    "pant", "pants", "pantalone", "pantaloni", "pantalon", "pantalones",
+    "hoodie", "hoodies", "felpa", "felpe", "sweatshirt", "sudadera",
+    "tee", "t-shirt", "tshirt", "maglia", "maglietta", "camiseta"
+}
 
 WEB_HEADERS = {
     "User-Agent": (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:128.0) "
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) "
         "Gecko/20100101 Firefox/128.0"
     ),
-    "Accept": (
-        "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,"
-        "image/webp,image/png,image/svg+xml,*/*;q=0.8"
-    ),
-    "Accept-Language": "it-IT,it;q=0.8,en-US;q=0.5,en;q=0.3",
-    "DNT": "1",
-    "Connection": "keep-alive",
-    "Upgrade-Insecure-Requests": "1",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "it-IT,it;q=0.9,en-US;q=0.8,en;q=0.7",
     "Sec-Fetch-Dest": "document",
     "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "cross-site",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
     "Sec-GPC": "1",
-    "Priority": "u=0, i",
-    "Pragma": "no-cache",
-    "Cache-Control": "no-cache",
-}
-
-PAROLE_VESTITI = (
-    "felpa", "felpe", "hoodie", "hoodies", "crewneck", "zip",
-    "sweatshirt", "sweater", "maglia", "maglione", "maglietta",
-    "t-shirt", "tshirt", "tee", "pantalone", "pantaloni", "tuta",
-    "tracksuit", "jogger", "jeans", "giacca", "giubbotto", "jacket"
-)
-
-PAROLE_ESCLUSE = (
-    "condition", "conditions", "condizioni", "condizione", "stato", "shape",
-    "cd", "dvd", "vinile", "vinyl", "album", "disco", "musica", "music",
-    "cover", "film", "movie", "book", "libro", "ps4", "ps5", "xbox", "game"
-)
-
-STATUS_MAP = {
-    "1": "Nuovo con cartellino",
-    "2": "Nuovo senza cartellino",
-    "3": "Ottime condizioni",
-    "4": "Buone condizioni",
-    "5": "Discreto",
-    "new_with_tags": "Nuovo con cartellino",
-    "new_without_tags": "Nuovo senza cartellino",
-    "very_good": "Ottime condizioni",
-    "good": "Buone condizioni",
-    "satisfactory": "Discreto",
 }
 
 
-class CatalogError(RuntimeError):
-    """Raised when Vinted does not return a valid catalogue response."""
-
-
-def configure_logging():
-    handler = RotatingFileHandler(
-        LOG_PATH,
-        maxBytes=5_000_000,
-        backupCount=5,
-    )
-    logging.basicConfig(
-        handlers=[handler, logging.StreamHandler(sys.stdout)],
-        format="%(asctime)s - %(levelname)s - %(message)s",
-        level=logging.INFO,
-    )
-
-
-def build_catalog_url(marketplace_url):
-    parsed_url = urlsplit(marketplace_url)
-    hostname = parsed_url.hostname
-    if not hostname:
-        raise ValueError("URL Vinted non valido")
-    if hostname.startswith("www."):
-        hostname = hostname[4:]
-    return urlunsplit(("https", f"api.{hostname}", "/svc-catalogue/items", "", ""))
-
-
-def build_api_headers(marketplace_url):
-    marketplace_url = marketplace_url.rstrip("/")
-    api_headers = {
-        "User-Agent": WEB_HEADERS["User-Agent"],
+def build_api_headers(session):
+    csrf_token = session.cookies.get("csrf_token", "")
+    return {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) "
+            "Gecko/20100101 Firefox/128.0"
+        ),
         "Accept": "application/json, text/plain, */*",
-        "Accept-Language": WEB_HEADERS["Accept-Language"],
-        "Platform": "web",
+        "Accept-Language": "it-IT,it;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Referer": "https://www.vinted.it/",
+        "Origin": "https://www.vinted.it",
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-origin",
+        "Sec-GPC": "1",
         "x-next-app": "marketplace-web",
-        "Origin": marketplace_url,
-        "Referer": f"{marketplace_url}/",
-    }
-    locale = getattr(Config, "vinted_locale", None)
-    if locale:
-        api_headers["Locale"] = locale
-    return api_headers
-
-
-def build_catalog_params(query):
-    for required_key in ("page", "per_page", "order", "filters"):
-        if required_key not in query:
-            raise ValueError(f"missing required query key: {required_key}")
-
-    params = {
-        key: value
-        for key, value in query.items()
-        if key != "filters" and value not in (None, "")
-    }
-    for filter_code, filter_ids in query["filters"].items():
-        normalized_ids = [str(filter_id) for filter_id in filter_ids]
-        if normalized_ids:
-            params[f"attribute_ids[{filter_code}]"] = ",".join(normalized_ids)
-    return params
-
-
-def load_analyzed_items(database_path=ITEMS_DATABASE_PATH):
-    database_path.touch(exist_ok=True)
-    with database_path.open("r", encoding="utf-8", errors="ignore") as database:
-        return {line.strip() for line in database if line.strip()}
-
-
-def save_analyzed_item(item_id, database_path=ITEMS_DATABASE_PATH):
-    with database_path.open("a", encoding="utf-8") as database:
-        database.write(f"{item_id}\n")
-
-
-def send_discord_notification(item_title, item_price, item_url, item_image, item_status="Ottime condizioni", seller_info="N/D", brand_title=None, matched_query=None):
-    webhook_url = BRAND_WEBHOOKS.get(str(matched_query).lower().strip())
-    if not webhook_url:
-        return True
-
-    webhook_url = webhook_url.removesuffix("/slack")
-    brand_display = brand_title if brand_title else matched_query
-
-    desc = (
-        f"🏷️ **Prezzo:** {item_price}\n"
-        f"👕 **Brand:** {brand_display}\n"
-        f"✨ **Condizioni:** {item_status}\n"
-        f"👤 **Venditore:** {seller_info}\n\n"
-        f"🛒 **[APRI L'ANNUNCIO SU VINTED]({item_url})**"
-    )
-
-    embed = {
-        "title": f"👕 {item_title[:240]}",
-        "url": item_url,
-        "description": desc,
-        "color": 0x09B1BA,
-        "footer": {
-            "text": "Vinted Steals • Drop in tempo reale"
-        },
-        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat()
+        "x-csrf-token": csrf_token,
     }
 
-    if item_image:
-        embed["image"] = {"url": item_image}
 
-    payload = {"embeds": [embed]}
-
-    for attempt in range(2):
-        try:
-            response = requests.post(webhook_url, json=payload, timeout=REQUEST_TIMEOUT_SECONDS)
-
-            if response.status_code == 429:
-                try:
-                    data = response.json()
-                    wait_time = float(data.get("retry_after", 2))
-                except Exception:
-                    wait_time = float(response.headers.get("Retry-After", 2))
-
-                if wait_time > 5.0:
-                    logging.warning("Rate limit prolungato su [%s] (%.1f sec). Salto per sicurezza.", matched_query, wait_time)
-                    return False
-
-                logging.warning("Rate limit su [%s]: attesa di %.2f sec...", matched_query, wait_time)
-                time.sleep(wait_time + 0.5)
-                continue
-
-            response.raise_for_status()
-            logging.info("Notifica inviata per [%s]: %s", matched_query, item_title)
-            time.sleep(1.0)
-            return True
-
-        except requests.exceptions.RequestException as error:
-            logging.error("Errore invio notifica: %s", error)
-            return False
-
-    return False
-
-
-def get_catalog_items(session, catalog_url, params, api_headers):
+def initialize_vinted_session():
+    session = requests.Session()
+    logging.info("Inizializzazione sessione Vinted...")
     try:
-        response = session.get(
-            catalog_url,
-            params=params,
-            headers=api_headers,
-            timeout=REQUEST_TIMEOUT_SECONDS,
-        )
-        response.raise_for_status()
-        data = response.json()
-        return data.get("items", [])
-    except Exception as error:
-        raise CatalogError(f"Catalogue request error: {error}") from error
+        resp = session.get(VINTED_BASE_URL, headers=WEB_HEADERS, timeout=15)
+        if resp.status_code == 200:
+            logging.info("Sessione Vinted inizializzata con successo.")
+        else:
+            logging.warning("Inizializzazione sessione Vinted fallita con codice %s", resp.status_code)
+    except Exception as exc:
+        logging.error("Errore durante l'inizializzazione della sessione Vinted: %s", exc)
+    return session
+
+
+def load_webhooks_mapping():
+    raw = os.getenv("DISCORD_WEBHOOKS_JSON", "")
+    if raw.strip():
+        try:
+            return json.loads(raw)
+        except Exception as exc:
+            logging.error("Errore nel caricamento di DISCORD_WEBHOOKS_JSON: %s", exc)
+    return {}
 
 
 def normalize_item(item):
-    item_id = item.get("id")
-    item_title = item.get("title")
-    item_url = item.get("url")
-    if not item_id or not item_title or not item_url:
-        return None
+    item_id = str(item.get("id", ""))
+    title = str(item.get("title", "")).strip()
+    brand = str(item.get("brand_title", "")).strip()
+    price = item.get("total_item_price") or item.get("price", "N/D")
+    currency = item.get("currency", "EUR")
+    url = item.get("url", "")
+    if url and not url.startswith("http"):
+        url = f"https://www.vinted.it{url}"
 
-    full_url = urljoin(f"{Config.vinted_url.rstrip('/')}/", str(item_url))
+    photo = item.get("photo", {}) or {}
+    image_url = photo.get("url") or photo.get("full_size_url", "")
 
-    price_data = item.get("price") or {}
-    amount = price_data.get("amount") or item.get("total_item_price")
-    currency = price_data.get("currency_code", "EUR")
-    price = f"{amount} {currency}" if amount else "N/A"
+    user = item.get("user", {}) or {}
+    seller = user.get("login", "Privato")
 
-    photo_data = item.get("photo") or {}
-    image_url = photo_data.get("full_size_url") or photo_data.get("url")
-
-    brand_title = item.get("brand_title") or ""
-
-    status_label = None
-    raw_status = str(item.get("status_id") or item.get("status") or "").lower()
-    status_label = STATUS_MAP.get(raw_status, item.get("status"))
-
-    if not status_label or status_label == "N/D":
-        status_label = "Ottime condizioni"
-
-    user_data = item.get("user") or {}
-    seller_name = user_data.get("login") or "N/D"
-    feedback_count = user_data.get("feedback_count")
-    feedback_reputation = user_data.get("feedback_reputation")
-
-    if feedback_count is not None and feedback_reputation is not None:
-        rating = round(float(feedback_reputation) * 5, 1)
-        seller_display = f"{seller_name} ({rating}⭐ • {feedback_count})"
-    elif seller_name != "N/D":
-        seller_display = seller_name
-    else:
-        seller_display = "N/D"
+    status = str(item.get("status", "")).strip()
+    if not status:
+        status = "Disponibile"
 
     return {
-        "id": str(item_id),
-        "title": str(item_title),
-        "brand": str(brand_title),
-        "status": str(status_label),
-        "seller": str(seller_display),
-        "price": price,
-        "url": full_url,
-        "image": image_url,
+        "id": item_id,
+        "title": title,
+        "brand": brand,
+        "price": f"{price} {currency}" if price != "N/D" else "N/D",
+        "url": url,
+        "image_url": image_url,
+        "seller": seller,
+        "condition": status,
     }
 
 
@@ -288,6 +126,14 @@ def is_relevant_item(normalized, query_text):
     title = normalized["title"].lower().replace("ü", "u")
     brand = normalized["brand"].lower().strip().replace("ü", "u")
 
+    # Regola per FiveFourFive / 545
+    if "five" in target or "545" in target:
+        if "fivefourfive" in brand or "five four five" in brand or "545" in brand:
+            return True
+        if "fivefourfive" in title or "five four five" in title or re.search(r"\b545\b", title):
+            return True
+
+    # Regola per Perfect
     if target == "perfect":
         if "perfect" in brand:
             return True
@@ -300,6 +146,7 @@ def is_relevant_item(normalized, query_text):
         has_clothing_term = any(c in words or c in title for c in PAROLE_VESTITI)
         return has_perfect_word and has_clothing_term
 
+    # Regola per Stussy
     if target in ("stussy", "stüssy"):
         return "stussy" in brand or bool(re.search(r"\bstussy\b", title))
 
@@ -310,85 +157,125 @@ def is_relevant_item(normalized, query_text):
     return bool(re.search(pattern, title))
 
 
-def process_item(item, analyzed_items, is_initial_run=False, matched_query=None):
-    normalized = normalize_item(item)
-    if not normalized or normalized["id"] in analyzed_items:
-        return True
+def send_discord_notification(webhook_url, item):
+    embed = {
+        "title": f"👕 {item['title']}",
+        "url": item["url"],
+        "color": 3447003,
+        "description": (
+            f"🏷️ **Prezzo:** {item['price']}\n"
+            f"👕 **Brand:** {item['brand']}\n"
+            f"✨ **Condizioni:** {item['condition']}\n"
+            f"👤 **Venditore:** {item['seller']}\n\n"
+            f"🛒 **[APRI L'ANNUNCIO SU VINTED]({item['url']})**"
+        ),
+        "footer": {
+            "text": "Vinted Steals • Drop in tempo reale"
+        },
+        "timestamp": datetime.now(timezone.utc).isoformat()
+    }
 
-    save_analyzed_item(normalized["id"])
-    analyzed_items.add(normalized["id"])
+    if item.get("image_url"):
+        embed["image"] = {"url": item["image_url"]}
 
-    if not is_relevant_item(normalized, matched_query):
-        return True
+    payload = {
+        "username": "Vinted Steals",
+        "embeds": [embed]
+    }
 
-    if is_initial_run:
-        return True
-
-    return send_discord_notification(
-        item_title=normalized["title"],
-        item_price=normalized["price"],
-        item_url=normalized["url"],
-        item_image=normalized["image"],
-        item_status=normalized.get("status", "Ottime condizioni"),
-        seller_info=normalized.get("seller", "N/D"),
-        brand_title=normalized["brand"],
-        matched_query=matched_query,
-    )
-
-
-def initialize_vinted_session(marketplace_url):
-    session = requests.Session()
-    session.get(marketplace_url, headers=WEB_HEADERS, timeout=REQUEST_TIMEOUT_SECONDS)
-    return session
+    try:
+        response = requests.post(webhook_url, json=payload, timeout=10)
+        if response.status_code in (200, 204):
+            logging.info("Notifica Discord inviata con successo per %s", item["id"])
+        elif response.status_code == 429:
+            retry_after = response.json().get("retry_after", 5)
+            logging.warning("Rate limit Discord raggiunto. Attesa di %s secondi...", retry_after)
+            time.sleep(retry_after)
+            requests.post(webhook_url, json=payload, timeout=10)
+        else:
+            logging.error("Errore invio Discord: %s - %s", response.status_code, response.text)
+    except Exception as exc:
+        logging.error("Eccezione durante l'invio su Discord: %s", exc)
 
 
-def main():
-    configure_logging()
-    catalog_url = build_catalog_url(Config.vinted_url)
-    queries = [build_catalog_params(q) for q in Config.queries]
-    api_headers = build_api_headers(Config.vinted_url)
-    analyzed_items = load_analyzed_items()
+def fetch_vinted_items(session, search_text):
+    params = {
+        "search_text": search_text,
+        "order": "newest_first",
+        "page": 1,
+        "per_page": 20,
+    }
+    api_url = f"{VINTED_BASE_URL}/api/v2/catalog/items"
+    headers = build_api_headers(session)
 
-    logging.info("Inizializzazione sessione Vinted...")
-    session = initialize_vinted_session(Config.vinted_url)
+    try:
+        response = session.get(api_url, headers=headers, params=params, timeout=15)
+        if response.status_code == 401 or response.status_code == 403:
+            logging.warning("Sessione scaduta o bloccata (codice %s). Reinizializzazione...", response.status_code)
+            return None
+        if response.status_code != 200:
+            logging.warning("Risposta imprevista da Vinted per '%s': codice %s", search_text, response.status_code)
+            return []
+        data = response.json()
+        return data.get("items", [])
+    except Exception as exc:
+        logging.error("Errore chiamata catalogo Vinted per '%s': %s", search_text, exc)
+        return []
 
+
+def run():
+    from Config import SEARCH_QUERIES
+
+    webhooks_map = load_webhooks_mapping()
+    session = initialize_vinted_session()
+    seen_ids = set()
     is_initial_run = True
+
     logging.info("Sincronizzazione iniziale degli annunci attuali in corso...")
 
     while True:
         try:
-            for params in queries:
-                matched_brand = params.get("search_text", "")
-                try:
-                    items = get_catalog_items(session, catalog_url, params, api_headers)
-                    for item in items:
-                        process_item(
-                            item,
-                            analyzed_items,
-                            is_initial_run=is_initial_run,
-                            matched_query=matched_brand,
-                        )
-                except CatalogError as err:
-                    logging.warning("Errore richiesta per [%s]: %s", matched_brand, err)
-                    time.sleep(1)
+            for query in SEARCH_QUERIES:
+                search_text = query.get("search_text", "")
+                channel_key = query.get("channel_key", "default")
+                webhook_url = webhooks_map.get(channel_key) or os.getenv("DISCORD_WEBHOOK_URL")
+
+                if not webhook_url:
+                    logging.warning("Nessun Webhook configurato per il canale '%s'", channel_key)
+                    continue
+
+                items = fetch_vinted_items(session, search_text)
+                if items is None:
+                    session = initialize_vinted_session()
+                    continue
+
+                for raw_item in items:
+                    norm = normalize_item(raw_item)
+                    item_id = norm["id"]
+
+                    if item_id in seen_ids:
+                        continue
+
+                    seen_ids.add(item_id)
+
+                    if is_initial_run:
+                        continue
+
+                    if is_relevant_item(norm, search_text):
+                        send_discord_notification(webhook_url, norm)
+                        time.sleep(1)
+
+                time.sleep(random.uniform(2.0, 4.0))
 
             if is_initial_run:
                 is_initial_run = False
-                logging.info("Sincronizzazione completata! In attesa di nuovi drop in tempo reale.")
+                logging.info("Sincronizzazione iniziale completata. Da adesso verranno notificati i nuovi drop.")
 
-            time.sleep(CHECK_INTERVAL_SECONDS)
+        except Exception as exc:
+            logging.error("Errore durante il ciclo di scansione: %s", exc)
 
-        except requests.exceptions.RequestException:
-            logging.info("Rinnovo sessione Vinted...")
-            try:
-                session = initialize_vinted_session(Config.vinted_url)
-            except Exception:
-                pass
-            time.sleep(10)
-        except Exception as error:
-            logging.error("Errore ciclo principale: %s", error)
-            time.sleep(CHECK_INTERVAL_SECONDS)
+        time.sleep(CHECK_INTERVAL_SECONDS)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    run()
