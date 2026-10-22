@@ -5,6 +5,7 @@ import email.utils
 import html
 import json
 import logging
+import re
 import smtplib
 import sys
 import time
@@ -150,29 +151,29 @@ def send_slack_message(item_title, item_price, item_url, item_image, brand_title
 
     payload = {"text": "\n".join(message_lines)}
 
-    try:
-        response = requests.post(webhook_url, json=payload, timeout=REQUEST_TIMEOUT_SECONDS)
-
-        # Gestione automatica del Rate Limit di Discord (errore 429)
-        if response.status_code == 429:
-            try:
-                wait_time = float(response.json().get("retry_after", 2))
-            except Exception:
-                wait_time = 2.0
-            logging.warning("Discord Rate Limit su [%s]: attesa di %.2f secondi...", matched_query, wait_time)
-            time.sleep(wait_time + 0.5)
+    for attempt in range(4):
+        try:
             response = requests.post(webhook_url, json=payload, timeout=REQUEST_TIMEOUT_SECONDS)
+            if response.status_code == 429:
+                try:
+                    data = response.json()
+                    wait_time = float(data.get("retry_after", 3))
+                except Exception:
+                    wait_time = float(response.headers.get("Retry-After", 3))
+                logging.warning("Discord Rate Limit su [%s]: attesa di %.2f sec (tentativo %d)...", matched_query, wait_time, attempt + 1)
+                time.sleep(wait_time + 1.0)
+                continue
 
-        response.raise_for_status()
-        logging.info("Discord inviato per [%s]: %s", matched_query, item_title)
-        
-        # Pausa di rispetto per non saturare i webhook di Discord
-        time.sleep(1.2)
-        return True
+            response.raise_for_status()
+            logging.info("Discord inviato per [%s]: %s", matched_query, item_title)
+            time.sleep(2.0)  # Pausa conservativa tra un messaggio e l'altro
+            return True
 
-    except requests.exceptions.RequestException as error:
-        logging.error("Errore invio notifica Discord: %s", error)
-        return False
+        except requests.exceptions.RequestException as error:
+            logging.error("Errore invio notifica Discord: %s", error)
+            time.sleep(2.0)
+
+    return False
 
 
 def get_catalog_items(session, catalog_url, params, api_headers):
@@ -216,11 +217,24 @@ def normalize_item(item):
 
 
 def is_relevant_item(normalized, query_text):
-    """Verifica che la query sia realmente presente nel Brand o nel Titolo."""
+    """Verifica severa: il termine deve essere nel brand o come parola intera nel titolo."""
     target = query_text.lower().strip()
     title = normalized["title"].lower()
-    brand = normalized["brand"].lower()
-    return (target in brand) or (target in title)
+    brand = normalized["brand"].lower().strip()
+
+    # Se il brand ufficiale coincide o contiene la query
+    if target in brand:
+        return True
+
+    # Se il brand è sconosciuto o generico, accetta solo se la parola è isolata nel titolo
+    pattern = rf"\b{re.escape(target)}\b"
+    if re.search(pattern, title):
+        # Esclude frasi comuni tipo 'perfect condition' o 'in perfect shape'
+        if target == "perfect" and ("condition" in title or "stato" in title or "shape" in title or "condizioni" in title):
+            return False
+        return True
+
+    return False
 
 
 def process_item(item, analyzed_items, is_initial_run=False, matched_query=None):
@@ -228,20 +242,20 @@ def process_item(item, analyzed_items, is_initial_run=False, matched_query=None)
     if not normalized or normalized["id"] in analyzed_items:
         return True
 
-    # Scarta risultati spam irrilevanti
+    # Salva comunque l'ID nel database per non ricontrollarlo
+    save_analyzed_item(normalized["id"])
+    analyzed_items.add(normalized["id"])
+
+    # Scarta se non passa il filtro anti-spam
     if not is_relevant_item(normalized, matched_query):
-        save_analyzed_item(normalized["id"])
-        analyzed_items.add(normalized["id"])
         return True
 
-    # Al primo avvio salva solo nel database senza notificare
+    # Se è il primo ciclo di avvio non inviare nulla
     if is_initial_run:
-        save_analyzed_item(normalized["id"])
-        analyzed_items.add(normalized["id"])
         return True
 
-    # Invio notifica per nuovi annunci in tempo reale
-    succeeded = send_slack_message(
+    # Invia notifica per drop reale
+    return send_slack_message(
         normalized["title"],
         normalized["price"],
         normalized["url"],
@@ -249,11 +263,6 @@ def process_item(item, analyzed_items, is_initial_run=False, matched_query=None)
         brand_title=normalized["brand"],
         matched_query=matched_query,
     )
-
-    if succeeded:
-        save_analyzed_item(normalized["id"])
-        analyzed_items.add(normalized["id"])
-    return succeeded
 
 
 def initialize_vinted_session(marketplace_url):
