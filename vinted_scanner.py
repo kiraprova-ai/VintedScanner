@@ -22,7 +22,26 @@ PROJECT_DIR = Path(__file__).resolve().parent
 ITEMS_DATABASE_PATH = PROJECT_DIR / "vinted_items.txt"
 LOG_PATH = PROJECT_DIR / "vinted_scanner.log"
 REQUEST_TIMEOUT_SECONDS = 25
-CHECK_INTERVAL_SECONDS = 4  # Scansione rapida per catturare i drop all'istante
+CHECK_INTERVAL_SECONDS = 6
+
+# Scarta categoricamente annunci più vecchi di 10 minuti (600 secondi)
+MAX_ITEM_AGE_SECONDS = 600
+
+# Filtri specifici per il brand 'Perfect'
+PERFECT_PAROLE_ESCLUSE = {
+    "cap", "hat", "gorro", "gorra", "cappello", "berretto", "beanie",
+    "gloves", "guanti", "guantes", "gants",
+    "scarf", "sciarpa", "bufanda", "echarpe",
+    "cover", "custodia", "case", "scarpe", "shoes", "sneakers"
+}
+
+PERFECT_PAROLE_VESTITI = {
+    "tuta", "tracksuit", "chandal", "survetement",
+    "hoodie", "hoodies", "felpa", "felpe", "sweatshirt", "sudadera",
+    "pant", "pants", "pantalone", "pantaloni", "pantalon", "pantalones", "jogger", "joggers",
+    "jacket", "giacca", "chaqueta", "blouson", "bomber", "cappotto", "coat", "fleece", "pile",
+    "tee", "t-shirt", "tshirt", "maglia", "maglietta", "camiseta"
+}
 
 WEB_HEADERS = {
     "User-Agent": (
@@ -105,7 +124,7 @@ def build_api_headers(marketplace_url):
     return api_headers
 
 
-def build_catalog_params(query):
+def build_catalog_params(query, page=1):
     if not isinstance(query, dict):
         raise ValueError("each entry in queries must be a dictionary")
 
@@ -116,9 +135,8 @@ def build_catalog_params(query):
         if key not in ("filters", "channel_key") and value not in (None, "")
     }
 
-    # Forza l'ordinamento sui più recenti
     params["order"] = "newest_first"
-    params["page"] = 1
+    params["page"] = page
     params["per_page"] = query.get("per_page", 20)
 
     if isinstance(filters, dict):
@@ -144,11 +162,10 @@ def save_analyzed_item(item_id, database_path=ITEMS_DATABASE_PATH):
 
 
 def send_discord_notification(webhook_url, item):
-    """Embed grafico identico allo screenshot."""
     embed = {
         "title": f"👕 {item['title']}",
         "url": item["url"],
-        "color": 0x00d2d3,  # Colore turchese/ciano dello screenshot
+        "color": 0x00d2d3,
         "description": (
             f"🏷️ **Prezzo:** {item['price']}\n"
             f"👕 **Brand:** {item['brand']}\n"
@@ -173,7 +190,7 @@ def send_discord_notification(webhook_url, item):
     try:
         response = requests.post(webhook_url, json=payload, timeout=REQUEST_TIMEOUT_SECONDS)
         if response.status_code in (200, 204):
-            logging.info("Notifica inviata con successo: %s", item["title"])
+            logging.info("Notifica inviata: %s", item["title"])
             return True
         elif response.status_code == 429:
             retry_after = response.json().get("retry_after", 2)
@@ -211,7 +228,7 @@ def get_catalog_items(session, catalog_url, params, api_headers):
     return items
 
 
-def normalize_item(item):
+def normalize_item(item, enforce_age_check=True):
     if not isinstance(item, dict):
         return None
 
@@ -220,6 +237,21 @@ def normalize_item(item):
     item_url = item.get("url")
     if item_id is None or not item_title or not item_url:
         return None
+
+    # Controllo orario rigido: scarta tutto ciò che ha più di 10 minuti
+    if enforce_age_check:
+        created_at = item.get("created_at_ts")
+        if not created_at and isinstance(item.get("photo"), dict):
+            created_at = item.get("photo", {}).get("high_resolution", {}).get("timestamp")
+
+        if created_at:
+            try:
+                now_ts = int(datetime.now(timezone.utc).timestamp())
+                age = now_ts - int(created_at)
+                if age > MAX_ITEM_AGE_SECONDS:
+                    return None
+            except Exception:
+                pass
 
     item_url = urljoin(f"{Config.vinted_url.rstrip('/')}/", str(item_url))
 
@@ -236,10 +268,8 @@ def normalize_item(item):
         photo_data = {}
 
     brand_title = item.get("brand_title") or "N/D"
-
     user_data = item.get("user") or {}
     seller = user_data.get("login") or "Privato"
-
     condition = item.get("status") or item.get("subtitle") or "Ottime condizioni"
 
     return {
@@ -265,7 +295,33 @@ def is_relevant_item(item, search_text):
             return True
         if "fivefourfive" in title or "five four five" in title or re.search(r"\b545\b", title):
             return True
+        return False
 
+    # Filtro mirato per 'Perfect' (esclude cibo per gatti, cover, fit, ecc.)
+    if target == "perfect":
+        # 1. Scarta categoricamente Perfect Fit o marchi non pertinenti
+        if "perfect fit" in brand or "perfectfit" in brand:
+            return False
+
+        words = set(re.findall(r"\b\w+\b", title))
+        # 2. Scarta accessori indesiderati
+        if any(bad in words for bad in PERFECT_PAROLE_ESCLUSE):
+            return False
+
+        # 3. Se il brand inserito dal venditore è proprio "perfect", controlliamo che non sia un accessorio vietato
+        if brand == "perfect":
+            return True
+
+        # 4. Se è nel titolo, deve contenere "perfect" isolato E un tipo di capo d'abbigliamento
+        has_perfect = bool(re.search(r"\bperfect\b", title))
+        has_apparel = any(c in words or c in title for c in PERFECT_PAROLE_VESTITI)
+        return has_perfect and has_apparel
+
+    # Stussy / Stüssy
+    if target in ("stussy", "stüssy"):
+        return "stussy" in brand or bool(re.search(r"\bstussy\b", title))
+
+    # Regola generale per Supreme, Scuffers, Corvidae, ecc.
     if target in brand or target in title:
         return True
 
@@ -286,7 +342,6 @@ def main():
     webhooks_map = load_webhooks_mapping()
     default_webhook = os.getenv("DISCORD_WEBHOOK_URL", "")
 
-    parsed_queries = [build_catalog_params(q) for q in Config.queries]
     analyzed_items = load_analyzed_items()
 
     session = initialize_vinted_session(Config.vinted_url)
@@ -294,36 +349,37 @@ def main():
     if anon_id:
         api_headers["X-Anon-Id"] = anon_id
 
-    # WARMUP: memorizza gli annunci vecchi senza inviare notifiche
-    logging.info("--- WARMUP IN CORSO: Archiviazione annunci attuali ---")
-    for params, channel_key in parsed_queries:
-        search_text = params.get("search_text", channel_key)
-        try:
-            items = get_catalog_items(session, catalog_url, params, api_headers)
-            for raw in items:
-                item = normalize_item(raw)
-                if item:
-                    analyzed_items.add(item["id"])
-                    save_analyzed_item(item["id"])
-            logging.info("[%s] Articoli già presenti registrati: %d", search_text, len(items))
-        except Exception as exc:
-            logging.warning("[%s] Errore warmup: %s", search_text, exc)
-        time.sleep(0.5)
+    # WARMUP: memorizza le prime due pagine (40 annunci per brand) per blindare la memoria all'avvio
+    logging.info("--- AVVIO WARMUP: Archiviazione annunci pre-esistenti ---")
+    for q in Config.queries:
+        for page in (1, 2):
+            params, channel_key = build_catalog_params(q, page=page)
+            search_text = params.get("search_text", channel_key)
+            try:
+                items = get_catalog_items(session, catalog_url, params, api_headers)
+                for raw in items:
+                    item = normalize_item(raw, enforce_age_check=False)
+                    if item:
+                        analyzed_items.add(item["id"])
+                        save_analyzed_item(item["id"])
+            except Exception as exc:
+                logging.warning("[%s - pag %d] Errore warmup: %s", search_text, page, exc)
+            time.sleep(0.4)
 
-    logging.info("--- WARMUP COMPLETATO! Database pronto con %d annunci ---", len(analyzed_items))
-    logging.info("Bot in ascolto per i nuovi drop...")
+    logging.info("--- WARMUP CONCLUSO: %d annunci memorizzati. Solo drop <10 min da adesso! ---", len(analyzed_items))
 
-    # LOOP VELOCE PER CATTURARE I DROP
+    # LOOP DI SCANSIONE CONTINUO
     while True:
         try:
-            for params, channel_key in parsed_queries:
+            for q in Config.queries:
+                params, channel_key = build_catalog_params(q, page=1)
                 search_text = params.get("search_text", channel_key)
                 webhook_url = webhooks_map.get(channel_key) or default_webhook
 
                 try:
                     items = get_catalog_items(session, catalog_url, params, api_headers)
                 except Exception as err:
-                    logging.warning("[%s] Errore API: %s. Refresh sessione...", search_text, err)
+                    logging.warning("[%s] Errore chiamata: %s. Refresh sessione...", search_text, err)
                     session = initialize_vinted_session(Config.vinted_url)
                     anon_id = session.cookies.get("anon_id")
                     if anon_id:
@@ -331,28 +387,30 @@ def main():
                     continue
 
                 for raw in items:
-                    item = normalize_item(raw)
+                    # 1. Controllo orario (< 10 minuti)
+                    item = normalize_item(raw, enforce_age_check=True)
                     if not item:
                         continue
 
                     item_id = item["id"]
 
-                    # Ignora annunci già presenti
+                    # 2. Controllo duplicati: se già registrato, skip immediato
                     if item_id in analyzed_items:
                         continue
 
                     analyzed_items.add(item_id)
                     save_analyzed_item(item_id)
 
+                    # 3. Filtro pertinenza (Perfect fit escluso, solo tute/capi validi, ecc.)
                     if is_relevant_item(item, search_text):
-                        logging.info("🔥 DROP RILEVATO: %s (%s)", item["title"], item["brand"])
+                        logging.info("🔥 DROP RILEVATO: %s (Brand: %s)", item["title"], item["brand"])
                         if webhook_url:
                             send_discord_notification(webhook_url, item)
 
-                time.sleep(0.6)
+                time.sleep(0.5)
 
         except Exception as exc:
-            logging.error("Errore loop di scansione: %s", exc)
+            logging.error("Errore generale scansione: %s", exc)
 
         time.sleep(CHECK_INTERVAL_SECONDS)
 
