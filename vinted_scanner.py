@@ -234,27 +234,27 @@ def normalize_item(item):
 
 def is_relevant_item(normalized, query_text):
     target = query_text.lower().strip()
-    title = normalized["title"].lower()
-    brand = normalized["brand"].lower().strip()
+    title = normalized["title"].lower().replace("ü", "u")
+    brand = normalized["brand"].lower().strip().replace("ü", "u")
 
-    # Logica specifica per "perfect"
+    # 1. Logica specifica per Perfect
     if target == "perfect":
-        # 1. Se il brand ufficiale impostato dal venditore è proprio "perfect", passa
         if brand == "perfect":
             return True
 
-        # 2. Se contiene parole spazzatura (CD, vinili, condizioni perfette), scarta subito
         words = set(re.findall(r"\b\w+\b", title))
         if any(bad in words for bad in PAROLE_ESCLUSE):
             return False
 
-        # 3. Deve contenere esplicitamente la parola "perfect" E un termine di vestiti
         has_perfect_word = bool(re.search(r"\bperfect\b", title))
         has_clothing_term = any(c in words or c in title for c in PAROLE_VESTITI)
-
         return has_perfect_word and has_clothing_term
 
-    # Logica standard per tutti gli altri brand
+    # 2. Logica specifica per Stussy (cattura sia stussy che stüssy ovunque)
+    if target in ("stussy", "stüssy"):
+        return "stussy" in brand or bool(re.search(r"\bstussy\b", title))
+
+    # 3. Logica standard per tutti gli altri brand
     if target in brand:
         return True
 
