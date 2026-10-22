@@ -24,10 +24,10 @@ LOG_PATH = PROJECT_DIR / "vinted_scanner.log"
 REQUEST_TIMEOUT_SECONDS = 25
 CHECK_INTERVAL_SECONDS = 6
 
-# Scarta categoricamente annunci più vecchi di 10 minuti (600 secondi)
-MAX_ITEM_AGE_SECONDS = 600
+# Filtro rigido a 5 minuti (300 secondi): annunci più vecchi vengono scartati all'istante
+MAX_ITEM_AGE_SECONDS = 300
 
-# Filtri specifici per esclusioni e abbigliamento per 'Perfect'
+# Parole escluse per il brand 'Perfect' (no accessori non voluti)
 PERFECT_PAROLE_ESCLUSE = {
     "cap", "hat", "gorro", "gorra", "cappello", "berretto", "beanie",
     "gloves", "guanti", "guantes", "gants",
@@ -35,6 +35,7 @@ PERFECT_PAROLE_ESCLUSE = {
     "cover", "custodia", "case", "scarpe", "shoes", "sneakers"
 }
 
+# Parole chiave d'abbigliamento per 'Perfect' (tute, felpe, giacche, pantaloni)
 PERFECT_PAROLE_VESTITI = {
     "tuta", "tracksuit", "chandal", "survetement",
     "hoodie", "hoodies", "felpa", "felpe", "sweatshirt", "sudadera",
@@ -190,7 +191,7 @@ def send_discord_notification(webhook_url, item):
     try:
         response = requests.post(webhook_url, json=payload, timeout=REQUEST_TIMEOUT_SECONDS)
         if response.status_code in (200, 204):
-            logging.info("Notifica inviata: %s", item["title"])
+            logging.info("Notifica inviata con successo: %s", item["title"])
             return True
         elif response.status_code == 429:
             retry_after = response.json().get("retry_after", 2)
@@ -228,7 +229,31 @@ def get_catalog_items(session, catalog_url, params, api_headers):
     return items
 
 
-def normalize_item(item, enforce_age_check=True):
+def get_item_real_age_seconds(session, item_id):
+    """Interroga direttamente i dettagli del capo per calcolare l'orario effettivo di caricamento."""
+    try:
+        url = f"https://www.vinted.it/api/v2/items/{item_id}"
+        resp = session.get(url, headers=WEB_HEADERS, timeout=8)
+        if resp.status_code == 200:
+            data = resp.json().get("item", {})
+            created_at = data.get("created_at_ts")
+            if not created_at and "created_at" in data:
+                raw_date = data.get("created_at")
+                if isinstance(raw_date, str):
+                    try:
+                        dt = datetime.fromisoformat(raw_date.replace("Z", "+00:00"))
+                        created_at = int(dt.timestamp())
+                    except Exception:
+                        pass
+            if created_at:
+                now_ts = int(datetime.now(timezone.utc).timestamp())
+                return now_ts - int(created_at)
+    except Exception as exc:
+        logging.debug("Impossibile recuperare timestamp dettagliato per item %s: %s", item_id, exc)
+    return None
+
+
+def normalize_item(item):
     if not isinstance(item, dict):
         return None
 
@@ -237,21 +262,6 @@ def normalize_item(item, enforce_age_check=True):
     item_url = item.get("url")
     if item_id is None or not item_title or not item_url:
         return None
-
-    # Controllo orario rigido: scarta annunci sopra i 10 minuti
-    if enforce_age_check:
-        created_at = item.get("created_at_ts")
-        if not created_at and isinstance(item.get("photo"), dict):
-            created_at = item.get("photo", {}).get("high_resolution", {}).get("timestamp")
-
-        if created_at:
-            try:
-                now_ts = int(datetime.now(timezone.utc).timestamp())
-                age = now_ts - int(created_at)
-                if age > MAX_ITEM_AGE_SECONDS:
-                    return None
-            except Exception:
-                pass
 
     item_url = urljoin(f"{Config.vinted_url.rstrip('/')}/", str(item_url))
 
@@ -360,7 +370,7 @@ def main():
     if anon_id:
         api_headers["X-Anon-Id"] = anon_id
 
-    # WARMUP: scarica le prime 2 pagine per brand per archiviare l'esistente
+    # WARMUP INIZIALE: Registra le prime 2 pagine di annunci già presenti per escluderli
     logging.info("--- AVVIO WARMUP: Archiviazione annunci pre-esistenti ---")
     for q in Config.queries:
         for page in (1, 2):
@@ -369,17 +379,17 @@ def main():
             try:
                 items = get_catalog_items(session, catalog_url, params, api_headers)
                 for raw in items:
-                    item = normalize_item(raw, enforce_age_check=False)
+                    item = normalize_item(raw)
                     if item:
                         analyzed_items.add(item["id"])
                         save_analyzed_item(item["id"])
             except Exception as exc:
                 logging.warning("[%s - pag %d] Errore warmup: %s", search_text, page, exc)
-            time.sleep(0.4)
+            time.sleep(0.3)
 
-    logging.info("--- WARMUP CONCLUSO: %d annunci memorizzati. Solo drop <10 min da adesso! ---", len(analyzed_items))
+    logging.info("--- WARMUP CONCLUSO: %d annunci in archivio. Monitoraggio drop attivi avviato! ---", len(analyzed_items))
 
-    # LOOP DI MONITORAGGIO REAL-TIME
+    # LOOP REAL-TIME
     while True:
         try:
             for q in Config.queries:
@@ -390,7 +400,7 @@ def main():
                 try:
                     items = get_catalog_items(session, catalog_url, params, api_headers)
                 except Exception as err:
-                    logging.warning("[%s] Errore chiamata: %s. Refresh sessione...", search_text, err)
+                    logging.warning("[%s] Errore API: %s. Refresh sessione...", search_text, err)
                     session = initialize_vinted_session(Config.vinted_url)
                     anon_id = session.cookies.get("anon_id")
                     if anon_id:
@@ -398,30 +408,38 @@ def main():
                     continue
 
                 for raw in items:
-                    # 1. Filtro orario (< 10 minuti)
-                    item = normalize_item(raw, enforce_age_check=True)
+                    item = normalize_item(raw)
                     if not item:
                         continue
 
                     item_id = item["id"]
 
-                    # 2. Controllo duplicati
+                    # 1. Se l'ID è già stato visto, skip
                     if item_id in analyzed_items:
                         continue
 
+                    # Archivia subito per non ricontrollarlo
                     analyzed_items.add(item_id)
                     save_analyzed_item(item_id)
 
-                    # 3. Filtri di pertinenza (Supreme, Stussy, Perfect, 545, ecc.)
-                    if is_relevant_item(item, search_text):
-                        logging.info("🔥 DROP RILEVATO: %s (Brand: %s)", item["title"], item["brand"])
-                        if webhook_url:
-                            send_discord_notification(webhook_url, item)
+                    # 2. Controllo pertinenza (brand, parole escluse, filtri)
+                    if not is_relevant_item(item, search_text):
+                        continue
+
+                    # 3. VERIFICA RIGIDA DELL'ETÀ REALE DELL'ANNUNCIO (Massimo 5 minuti / 300 secondi)
+                    age_seconds = get_item_real_age_seconds(session, item_id)
+                    if age_seconds is not None and age_seconds > MAX_ITEM_AGE_SECONDS:
+                        logging.info("Scartato annuncio vecchio (%d sec fa): %s", age_seconds, item["title"])
+                        continue
+
+                    logging.info("🔥 DROP REALE IN DIRETTA: %s (Brand: %s)", item["title"], item["brand"])
+                    if webhook_url:
+                        send_discord_notification(webhook_url, item)
 
                 time.sleep(0.5)
 
         except Exception as exc:
-            logging.error("Errore generale scansione: %s", exc)
+            logging.error("Errore loop scansione: %s", exc)
 
         time.sleep(CHECK_INTERVAL_SECONDS)
 
