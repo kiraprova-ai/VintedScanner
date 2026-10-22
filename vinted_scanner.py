@@ -13,7 +13,7 @@ logging.basicConfig(
 )
 
 VINTED_BASE_URL = "https://www.vinted.it"
-CHECK_INTERVAL_SECONDS = 10  # Ciclo rapido per drop in tempo reale
+CHECK_INTERVAL_SECONDS = 10
 
 PAROLE_ESCLUSE = {
     "cap", "hat", "gorro", "gorra", "cappello", "berretto", "beanie",
@@ -53,7 +53,7 @@ def create_vinted_session():
     session = requests.Session()
     session.headers.update(BROWSER_HEADERS)
     try:
-        res = session.get(VINTED_BASE_URL, timeout=10)
+        res = session.get(VINTED_BASE_URL, timeout=15)
         if res.status_code == 200:
             logging.info("Sessione Vinted inizializzata con cookie.")
         else:
@@ -78,17 +78,20 @@ def fetch_items(session, search_text):
     }
 
     try:
-        resp = session.get(url, params=params, headers=headers, timeout=10)
+        resp = session.get(url, params=params, headers=headers, timeout=20)
         if resp.status_code in (401, 403, 404):
-            session.get(f"{VINTED_BASE_URL}/catalog", timeout=10)
+            session.get(f"{VINTED_BASE_URL}/catalog", timeout=15)
             headers["x-anon-id"] = session.cookies.get("anon_id", "")
-            resp = session.get(url, params=params, headers=headers, timeout=10)
+            resp = session.get(url, params=params, headers=headers, timeout=20)
 
         if resp.status_code == 200:
             return resp.json().get("items", [])
         return []
+    except requests.exceptions.Timeout:
+        logging.warning("Timeout di rete per '%s', riprovo al prossimo ciclo.", search_text)
+        return []
     except Exception as exc:
-        logging.error("Errore fetch per '%s': %s", search_text, exc)
+        logging.warning("Errore temporaneo fetch per '%s': %s", search_text, exc)
         return []
 
 
@@ -121,7 +124,7 @@ def is_relevant_item(normalized, query_text):
     if target in ("stussy", "stüssy"):
         return "stussy" in brand or bool(re.search(r"\bstussy\b", title))
 
-    # Regola generale per tutti gli altri brand
+    # Regola standard per gli altri marchi
     if target in brand:
         return True
 
@@ -156,13 +159,13 @@ def send_discord_notification(webhook_url, item):
     }
 
     try:
-        response = requests.post(webhook_url, json=payload, timeout=8)
+        response = requests.post(webhook_url, json=payload, timeout=10)
         if response.status_code in (200, 204):
             logging.info("Notifica Discord inviata all'istante per ID %s", item["id"])
         elif response.status_code == 429:
             retry_after = response.json().get("retry_after", 3)
             time.sleep(retry_after)
-            requests.post(webhook_url, json=payload, timeout=8)
+            requests.post(webhook_url, json=payload, timeout=10)
     except Exception as exc:
         logging.error("Errore invio notifica Discord: %s", exc)
 
@@ -217,8 +220,6 @@ def main():
             for q in queries:
                 search_text = q.get("search_text", "")
                 channel_key = q.get("channel_key", search_text)
-                
-                # Cerca prima la chiave specifica, poi il default
                 webhook_url = webhooks_map.get(channel_key) or default_webhook
 
                 if not webhook_url:
@@ -235,14 +236,13 @@ def main():
 
                     seen_ids.add(item_id)
 
-                    # Durante il primissimo giro memorizza e basta, poi invia subito
                     if is_initial_run:
                         continue
 
                     if is_relevant_item(norm, search_text):
                         send_discord_notification(webhook_url, norm)
 
-                time.sleep(1.0)  # Pausa breve per reattività massima
+                time.sleep(1.0)
 
             if is_initial_run:
                 is_initial_run = False
