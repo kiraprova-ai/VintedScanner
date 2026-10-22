@@ -7,13 +7,13 @@ import logging
 from datetime import datetime, timezone
 import requests
 
-from Config import queries
-from vinted_query_builder import VintedQueryBuilder
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s"
 )
+
+VINTED_BASE_URL = "https://www.vinted.it"
+CHECK_INTERVAL_SECONDS = 10  # Ciclo rapido per drop in tempo reale
 
 PAROLE_ESCLUSE = {
     "cap", "hat", "gorro", "gorra", "cappello", "berretto", "beanie",
@@ -29,6 +29,15 @@ PAROLE_VESTITI = {
     "tee", "t-shirt", "tshirt", "maglia", "maglietta", "camiseta"
 }
 
+BROWSER_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "it-IT,it;q=0.9,en-US;q=0.8,en;q=0.7",
+}
+
 
 def load_webhooks_mapping():
     raw = os.getenv("DISCORD_WEBHOOKS_JSON", "")
@@ -36,8 +45,51 @@ def load_webhooks_mapping():
         try:
             return json.loads(raw)
         except Exception as exc:
-            logging.error("Errore nel parsing di DISCORD_WEBHOOKS_JSON: %s", exc)
+            logging.error("Errore parsing DISCORD_WEBHOOKS_JSON: %s", exc)
     return {}
+
+
+def create_vinted_session():
+    session = requests.Session()
+    session.headers.update(BROWSER_HEADERS)
+    try:
+        res = session.get(VINTED_BASE_URL, timeout=10)
+        if res.status_code == 200:
+            logging.info("Sessione Vinted inizializzata con cookie.")
+        else:
+            logging.warning("Inizializzazione Vinted: HTTP %s", res.status_code)
+    except Exception as exc:
+        logging.error("Errore connessione iniziale Vinted: %s", exc)
+    return session
+
+
+def fetch_items(session, search_text):
+    url = f"{VINTED_BASE_URL}/api/v2/catalog/items"
+    params = {
+        "search_text": search_text,
+        "order": "newest_first",
+        "page": 1,
+        "per_page": 20
+    }
+    headers = {
+        "Accept": "application/json, text/plain, */*",
+        "Referer": f"{VINTED_BASE_URL}/catalog?search_text={requests.utils.quote(search_text)}",
+        "x-anon-id": session.cookies.get("anon_id", "")
+    }
+
+    try:
+        resp = session.get(url, params=params, headers=headers, timeout=10)
+        if resp.status_code in (401, 403, 404):
+            session.get(f"{VINTED_BASE_URL}/catalog", timeout=10)
+            headers["x-anon-id"] = session.cookies.get("anon_id", "")
+            resp = session.get(url, params=params, headers=headers, timeout=10)
+
+        if resp.status_code == 200:
+            return resp.json().get("items", [])
+        return []
+    except Exception as exc:
+        logging.error("Errore fetch per '%s': %s", search_text, exc)
+        return []
 
 
 def is_relevant_item(normalized, query_text):
@@ -69,6 +121,7 @@ def is_relevant_item(normalized, query_text):
     if target in ("stussy", "stüssy"):
         return "stussy" in brand or bool(re.search(r"\bstussy\b", title))
 
+    # Regola generale per tutti gli altri brand
     if target in brand:
         return True
 
@@ -103,17 +156,15 @@ def send_discord_notification(webhook_url, item):
     }
 
     try:
-        response = requests.post(webhook_url, json=payload, timeout=10)
+        response = requests.post(webhook_url, json=payload, timeout=8)
         if response.status_code in (200, 204):
-            logging.info("Notifica inviata su Discord per l'articolo %s", item["id"])
+            logging.info("Notifica Discord inviata all'istante per ID %s", item["id"])
         elif response.status_code == 429:
-            retry_after = response.json().get("retry_after", 5)
+            retry_after = response.json().get("retry_after", 3)
             time.sleep(retry_after)
-            requests.post(webhook_url, json=payload, timeout=10)
-        else:
-            logging.error("Errore webhook Discord: %s - %s", response.status_code, response.text)
+            requests.post(webhook_url, json=payload, timeout=8)
     except Exception as exc:
-        logging.error("Eccezione durante l'invio su Discord: %s", exc)
+        logging.error("Errore invio notifica Discord: %s", exc)
 
 
 def parse_vinted_item(item):
@@ -149,39 +200,31 @@ def parse_vinted_item(item):
 
 
 def main():
+    import Config
+
+    queries = getattr(Config, "queries", getattr(Config, "SEARCH_QUERIES", []))
     webhooks_map = load_webhooks_mapping()
     default_webhook = os.getenv("DISCORD_WEBHOOK_URL", "")
 
-    logging.info("Inizializzazione sessioni e costruttori di ricerca Vinted...")
-    builders = []
-    for q in queries:
-        qb = VintedQueryBuilder(q)
-        builders.append(qb)
-
+    session = create_vinted_session()
     seen_ids = set()
     is_initial_run = True
 
-    logging.info("Sincronizzazione iniziale degli annunci attuali in corso...")
+    logging.info("Sincronizzazione rapida del catalogo attuale...")
 
     while True:
         try:
-            for qb in builders:
-                search_text = qb.query.get("search_text", "")
-                channel_key = qb.query.get("channel_key", search_text)
+            for q in queries:
+                search_text = q.get("search_text", "")
+                channel_key = q.get("channel_key", search_text)
+                
+                # Cerca prima la chiave specifica, poi il default
                 webhook_url = webhooks_map.get(channel_key) or default_webhook
 
                 if not webhook_url:
                     continue
 
-                try:
-                    items = qb.find_items()
-                except Exception as err:
-                    logging.warning("Errore recupero annunci per '%s': %s", search_text, err)
-                    continue
-
-                if not items:
-                    time.sleep(random.uniform(1.5, 3.0))
-                    continue
+                items = fetch_items(session, search_text)
 
                 for raw_item in items:
                     norm = parse_vinted_item(raw_item)
@@ -192,23 +235,24 @@ def main():
 
                     seen_ids.add(item_id)
 
+                    # Durante il primissimo giro memorizza e basta, poi invia subito
                     if is_initial_run:
                         continue
 
                     if is_relevant_item(norm, search_text):
                         send_discord_notification(webhook_url, norm)
-                        time.sleep(1)
 
-                time.sleep(random.uniform(2.0, 4.0))
+                time.sleep(1.0)  # Pausa breve per reattività massima
 
             if is_initial_run:
                 is_initial_run = False
-                logging.info("Sincronizzazione iniziale completata. Da adesso verranno notificati i nuovi drop.")
+                logging.info("Sincronizzazione completata! Monitoraggio drop attivo in tempo reale.")
 
         except Exception as exc:
-            logging.error("Errore generale durante la scansione: %s", exc)
+            logging.error("Errore nel ciclo: %s", exc)
+            session = create_vinted_session()
 
-        time.sleep(30)
+        time.sleep(CHECK_INTERVAL_SECONDS)
 
 
 if __name__ == "__main__":
