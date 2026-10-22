@@ -54,6 +54,21 @@ WEB_HEADERS = {
     "Cache-Control": "no-cache",
 }
 
+# Capi ammessi per la query "perfect"
+PAROLE_VESTITI = (
+    "felpa", "felpe", "hoodie", "hoodies", "crewneck", "zip",
+    "sweatshirt", "sweater", "maglia", "maglione", "maglietta",
+    "t-shirt", "tshirt", "tee", "pantalone", "pantaloni", "tuta",
+    "tracksuit", "jogger", "jeans", "giacca", "giubbotto", "jacket"
+)
+
+# Termini non correlati da scartare immediatamente
+PAROLE_ESCLUSE = (
+    "condition", "conditions", "condizioni", "condizione", "stato", "shape",
+    "cd", "dvd", "vinile", "vinyl", "album", "disco", "musica", "music",
+    "cover", "film", "movie", "book", "libro", "ps4", "ps5", "xbox", "game"
+)
+
 
 class CatalogError(RuntimeError):
     """Raised when Vinted does not return a valid catalogue response."""
@@ -132,7 +147,6 @@ def send_discord_notification(item_title, item_price, item_url, item_image, bran
     if not webhook_url:
         return True
 
-    # Rimuove il suffisso legacy se presente
     webhook_url = webhook_url.removesuffix("/slack")
 
     brand_display = brand_title if brand_title else matched_query
@@ -223,16 +237,29 @@ def is_relevant_item(normalized, query_text):
     title = normalized["title"].lower()
     brand = normalized["brand"].lower().strip()
 
+    # Logica specifica per "perfect"
+    if target == "perfect":
+        # 1. Se il brand ufficiale impostato dal venditore è proprio "perfect", passa
+        if brand == "perfect":
+            return True
+
+        # 2. Se contiene parole spazzatura (CD, vinili, condizioni perfette), scarta subito
+        words = set(re.findall(r"\b\w+\b", title))
+        if any(bad in words for bad in PAROLE_ESCLUSE):
+            return False
+
+        # 3. Deve contenere esplicitamente la parola "perfect" E un termine di vestiti
+        has_perfect_word = bool(re.search(r"\bperfect\b", title))
+        has_clothing_term = any(c in words or c in title for c in PAROLE_VESTITI)
+
+        return has_perfect_word and has_clothing_term
+
+    # Logica standard per tutti gli altri brand
     if target in brand:
         return True
 
     pattern = rf"\b{re.escape(target)}\b"
-    if re.search(pattern, title):
-        if target == "perfect" and ("condition" in title or "stato" in title or "shape" in title or "condizioni" in title):
-            return False
-        return True
-
-    return False
+    return bool(re.search(pattern, title))
 
 
 def process_item(item, analyzed_items, is_initial_run=False, matched_query=None):
