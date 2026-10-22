@@ -4,7 +4,7 @@ smtp_psw = ""
 smtp_server = ""
 smtp_toaddrs = []
 
-# WebHook notification (Discord compatibile con /slack finale)
+# WebHook notification (Discord)
 slack_webhook_url = "https://discord.com/api/webhooks/1562768393575079946/6GGNmryFIWm8PHja91CXxBM2feYNZvr92JfbyoyrBV-3NjB8N6uw06OzXsSP6q84o1_b/slack"
 
 # Telegram Token and ChatID for notification
@@ -18,34 +18,42 @@ vinted_locale = "it-IT"
 queries = [
     {
         'search_text': 'scuffers',
-        'order': 'newest_first'
+        'order': 'newest_first',
+        'page': 1
     },
     {
         'search_text': 'reaven',
-        'order': 'newest_first'
+        'order': 'newest_first',
+        'page': 1
     },
     {
         'search_text': 'fiveforufive',
-        'order': 'newest_first'
+        'order': 'newest_first',
+        'page': 1
     },
     {
         'search_text': 'corvidae',
-        'order': 'newest_first'
+        'order': 'newest_first',
+        'page': 1
     },
     {
         'search_text': 'perfect',
-        'order': 'newest_first'
+        'order': 'newest_first',
+        'page': 1
     },
     {
         'search_text': 'ebtm',
-        'order': 'newest_first'
+        'order': 'newest_first',
+        'page': 1
     },
     {
         'search_text': '5mc2',
-        'order': 'newest_first'
+        'order': 'newest_first',
+        'page': 1
     },
     {
         'search_text': 'deputy department',
-        'order': 'newest_first'
+        'order': 'newest_first',
+        'page': 1
     }
 ]
