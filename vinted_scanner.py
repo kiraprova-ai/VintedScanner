@@ -12,7 +12,7 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s"
 )
 
-VINTED_BASE_URL = "https://www.vinted.it"
+VINTED_DOMAIN = "www.vinted.it"
 CHECK_INTERVAL_SECONDS = 8
 
 PAROLE_ESCLUSE = {
@@ -29,21 +29,14 @@ PAROLE_VESTITI = {
     "tee", "t-shirt", "tshirt", "maglia", "maglietta", "camiseta"
 }
 
-BROWSER_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "application/json, text/plain, */*",
     "Accept-Language": "it-IT,it;q=0.9,en-US;q=0.8,en;q=0.7",
-    "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
-    "Sec-Ch-Ua-Mobile": "?0",
-    "Sec-Ch-Ua-Platform": '"Windows"',
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "none",
-    "Sec-Fetch-User": "?1",
-    "Upgrade-Insecure-Requests": "1"
+    "Accept-Encoding": "gzip, deflate, br",
+    "Origin": f"https://{VINTED_DOMAIN}",
+    "Referer": f"https://{VINTED_DOMAIN}/catalog",
+    "Connection": "keep-alive"
 }
 
 
@@ -57,59 +50,52 @@ def load_webhooks_mapping():
     return {}
 
 
-def init_vinted_session():
-    session = requests.Session()
-    session.headers.update(BROWSER_HEADERS)
-    try:
-        # Passaggio 1: Visita la homepage per impostare il set-cookie iniziale
-        resp = session.get(VINTED_BASE_URL, timeout=15)
+class VintedClient:
+    def __init__(self):
+        self.session = requests.Session()
+        self.session.headers.update(HEADERS)
+        self.init_session()
+
+    def init_session(self):
+        try:
+            # Visita prima la home per il set-cookie principale (_vinted_fr_session)
+            resp = self.session.get(f"https://{VINTED_DOMAIN}/", timeout=15)
+            # Seconda chiamata su catalog per abilitare l'anon_id
+            self.session.get(f"https://{VINTED_DOMAIN}/catalog", timeout=15)
+            logging.info("Sessione Vinted inizializzata. Cookie: %s", list(self.session.cookies.keys()))
+        except Exception as e:
+            logging.error("Errore inizializzazione Vinted: %s", e)
+
+    def search(self, search_text):
+        # Proviamo entrambi gli endpoint noti di Vinted (items e catalog/items)
+        endpoints = [
+            f"https://{VINTED_DOMAIN}/api/v2/catalog/items",
+            f"https://{VINTED_DOMAIN}/api/v2/items"
+        ]
         
-        # Passaggio 2: Visita il catalogo per ottenere il cookie anon_id
-        session.get(f"{VINTED_BASE_URL}/catalog", timeout=15)
+        params = {
+            "search_text": search_text,
+            "order": "newest_first",
+            "page": 1,
+            "per_page": 20
+        }
         
-        cookies_found = list(session.cookies.keys())
-        logging.info("Sessione Vinted inizializzata. Cookie attivi: %s", cookies_found)
-    except Exception as exc:
-        logging.error("Errore nell'inizializzazione cookie: %s", exc)
-    return session
+        # Inietta l'anon_id se presente nei cookie
+        anon_id = self.session.cookies.get("anon_id", "")
+        if anon_id:
+            self.session.headers["x-anon-id"] = anon_id
+            
+        for url in endpoints:
+            try:
+                r = self.session.get(url, params=params, timeout=15)
+                if r.status_code == 200:
+                    data = r.json()
+                    return data.get("items", [])
+                elif r.status_code in (401, 403):
+                    self.init_session()
+            except Exception:
+                continue
 
-
-def fetch_items(session, search_text):
-    url = f"{VINTED_BASE_URL}/api/v2/catalog/items"
-    params = {
-        "search_text": search_text,
-        "order": "newest_first",
-        "page": 1,
-        "per_page": 20
-    }
-    
-    anon_id = session.cookies.get("anon_id", "")
-    headers = {
-        "User-Agent": BROWSER_HEADERS["User-Agent"],
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "it-IT,it;q=0.9",
-        "Referer": f"{VINTED_BASE_URL}/catalog?search_text={requests.utils.quote(search_text)}",
-        "x-anon-id": anon_id
-    }
-
-    try:
-        resp = session.get(url, params=params, headers=headers, timeout=15)
-        
-        # Se bloccato o scaduto, rinnova la sessione
-        if resp.status_code in (401, 403, 404):
-            logging.warning("[%s] Ricevuto HTTP %s da Vinted. Rinnovo sessione...", search_text, resp.status_code)
-            session.get(f"{VINTED_BASE_URL}/catalog", timeout=15)
-            headers["x-anon-id"] = session.cookies.get("anon_id", "")
-            resp = session.get(url, params=params, headers=headers, timeout=15)
-
-        if resp.status_code == 200:
-            data = resp.json()
-            return data.get("items", [])
-        else:
-            logging.warning("[%s] Vinted API status: %s", search_text, resp.status_code)
-            return []
-    except Exception as exc:
-        logging.warning("Errore fetch per '%s': %s", search_text, exc)
         return []
 
 
@@ -118,14 +104,14 @@ def is_relevant_item(normalized, query_text):
     title = normalized["title"].lower().replace("ü", "u")
     brand = normalized["brand"].lower().strip().replace("ü", "u")
 
-    # Regola 545 / FiveFourFive
+    # 545 / FiveFourFive
     if "five" in target or "545" in target:
         if "fivefourfive" in brand or "five four five" in brand or "545" in brand:
             return True
         if "fivefourfive" in title or "five four five" in title or re.search(r"\b545\b", title):
             return True
 
-    # Regola Perfect
+    # Perfect
     if target == "perfect":
         if "perfect" in brand:
             return True
@@ -136,11 +122,10 @@ def is_relevant_item(normalized, query_text):
         has_clothing_term = any(c in words or c in title for c in PAROLE_VESTITI)
         return has_perfect_word and has_clothing_term
 
-    # Regola Stussy
+    # Stussy
     if target in ("stussy", "stüssy"):
         return "stussy" in brand or bool(re.search(r"\bstussy\b", title))
 
-    # Regola generale per Supreme, Scuffers, Corvidae, ecc.
     if target in brand or target in title:
         return True
 
@@ -176,13 +161,11 @@ def send_discord_notification(webhook_url, item):
     try:
         resp = requests.post(webhook_url, json=payload, timeout=8)
         if resp.status_code in (200, 204):
-            logging.info("Notifica Discord recapitata per '%s'", item["title"])
+            logging.info("Notifica inviata su Discord per '%s'", item["title"])
         elif resp.status_code == 429:
             retry_after = resp.json().get("retry_after", 3)
             time.sleep(retry_after)
             requests.post(webhook_url, json=payload, timeout=8)
-        else:
-            logging.error("Errore Discord (%s): %s", resp.status_code, resp.text)
     except Exception as exc:
         logging.error("Errore invio Discord: %s", exc)
 
@@ -195,7 +178,7 @@ def parse_vinted_item(item):
     currency = item.get("currency", "EUR")
     url = item.get("url", "")
     if url and not url.startswith("http"):
-        url = f"https://www.vinted.it{url}"
+        url = f"https://{VINTED_DOMAIN}{url}"
 
     photo = item.get("photo", {}) or {}
     image_url = photo.get("url") or photo.get("full_size_url", "")
@@ -226,11 +209,11 @@ def main():
     webhooks_map = load_webhooks_mapping()
     default_webhook = os.getenv("DISCORD_WEBHOOK_URL", "")
 
-    session = init_vinted_session()
+    client = VintedClient()
     seen_ids = set()
     is_initial_run = True
 
-    logging.info("Sincronizzazione rapida del catalogo...")
+    logging.info("Sincronizzazione catalogo...")
 
     while True:
         try:
@@ -242,10 +225,10 @@ def main():
                 if not webhook_url:
                     continue
 
-                items = fetch_items(session, search_text)
+                items = client.search(search_text)
 
                 if not is_initial_run:
-                    logging.info("[%s] Risultati trovati da Vinted: %s", search_text, len(items))
+                    logging.info("[%s] Articoli ricevuti: %d", search_text, len(items))
 
                 for raw_item in items:
                     norm = parse_vinted_item(raw_item)
@@ -259,22 +242,19 @@ def main():
                     if is_initial_run:
                         continue
 
-                    logging.info("--> RILEVATO DROP: '%s' | Brand: '%s'", norm["title"], norm["brand"])
+                    logging.info("DROP TROVATO: %s (%s)", norm["title"], norm["brand"])
 
                     if is_relevant_item(norm, search_text):
                         send_discord_notification(webhook_url, norm)
-                    else:
-                        logging.info("Articolo ignorato dal filtro: %s", norm["title"])
 
                 time.sleep(1.0)
 
             if is_initial_run:
                 is_initial_run = False
-                logging.info("Sincronizzazione completata! Elementi memorizzati: %s", len(seen_ids))
+                logging.info("Sincronizzazione completata! Elementi memorizzati: %d", len(seen_ids))
 
         except Exception as exc:
-            logging.error("Errore ciclo: %s", exc)
-            session = init_vinted_session()
+            logging.error("Errore nel loop: %s", exc)
 
         time.sleep(CHECK_INTERVAL_SECONDS)
 
