@@ -33,7 +33,7 @@ PROJECT_DIR = Path(__file__).resolve().parent
 ITEMS_DATABASE_PATH = PROJECT_DIR / "vinted_items.txt"
 LOG_PATH = PROJECT_DIR / "vinted_scanner.log"
 REQUEST_TIMEOUT_SECONDS = 30
-CHECK_INTERVAL_SECONDS = 30  # Ridotto a 30s per catturare i drop ancora più velocemente
+CHECK_INTERVAL_SECONDS = 30
 
 WEB_HEADERS = {
     "User-Agent": (
@@ -56,6 +56,7 @@ WEB_HEADERS = {
     "Pragma": "no-cache",
     "Cache-Control": "no-cache",
 }
+
 
 class CatalogError(RuntimeError):
     """Raised when Vinted does not return a valid catalogue response."""
@@ -147,15 +148,28 @@ def send_slack_message(item_title, item_price, item_url, item_image, brand_title
     if item_image:
         message_lines.append(f"📷 {item_image}")
 
+    payload = {"text": "\n".join(message_lines)}
+
     try:
-        response = requests.post(
-            webhook_url,
-            json={"text": "\n".join(message_lines)},
-            timeout=REQUEST_TIMEOUT_SECONDS,
-        )
+        response = requests.post(webhook_url, json=payload, timeout=REQUEST_TIMEOUT_SECONDS)
+
+        # Gestione automatica del Rate Limit di Discord (errore 429)
+        if response.status_code == 429:
+            try:
+                wait_time = float(response.json().get("retry_after", 2))
+            except Exception:
+                wait_time = 2.0
+            logging.warning("Discord Rate Limit su [%s]: attesa di %.2f secondi...", matched_query, wait_time)
+            time.sleep(wait_time + 0.5)
+            response = requests.post(webhook_url, json=payload, timeout=REQUEST_TIMEOUT_SECONDS)
+
         response.raise_for_status()
         logging.info("Discord inviato per [%s]: %s", matched_query, item_title)
+        
+        # Pausa di rispetto per non saturare i webhook di Discord
+        time.sleep(1.2)
         return True
+
     except requests.exceptions.RequestException as error:
         logging.error("Errore invio notifica Discord: %s", error)
         return False
@@ -189,7 +203,6 @@ def normalize_item(item):
     currency = price_data.get("currency_code", "EUR")
     price = f"{amount} {currency}" if amount else "N/A"
     photo_data = item.get("photo") or {}
-    
     brand_title = item.get("brand_title") or ""
 
     return {
@@ -203,12 +216,10 @@ def normalize_item(item):
 
 
 def is_relevant_item(normalized, query_text):
-    """Verifica che la parola ricercata sia realmente nel Brand o nel Titolo"""
+    """Verifica che la query sia realmente presente nel Brand o nel Titolo."""
     target = query_text.lower().strip()
     title = normalized["title"].lower()
     brand = normalized["brand"].lower()
-    
-    # Se il brand coincide esattamente o la parola chiave è presente nel titolo o nel brand dell'annuncio
     return (target in brand) or (target in title)
 
 
@@ -217,19 +228,19 @@ def process_item(item, analyzed_items, is_initial_run=False, matched_query=None)
     if not normalized or normalized["id"] in analyzed_items:
         return True
 
-    # FILTRO ANTI-SPAM: scarta i risultati casuali (es. "perfect condition")
+    # Scarta risultati spam irrilevanti
     if not is_relevant_item(normalized, matched_query):
         save_analyzed_item(normalized["id"])
         analyzed_items.add(normalized["id"])
         return True
 
-    # Se è il primo avvio, memorizza silenziosamente
+    # Al primo avvio salva solo nel database senza notificare
     if is_initial_run:
         save_analyzed_item(normalized["id"])
         analyzed_items.add(normalized["id"])
         return True
 
-    # Notifica in tempo reale
+    # Invio notifica per nuovi annunci in tempo reale
     succeeded = send_slack_message(
         normalized["title"],
         normalized["price"],
@@ -283,12 +294,12 @@ def main():
 
             if is_initial_run:
                 is_initial_run = False
-                logging.info("Sincronizzazione completata! Filtro anti-spam attivo, in attesa di nuovi drop reali.")
+                logging.info("Sincronizzazione completata! In attesa di nuovi drop in tempo reale.")
 
             time.sleep(CHECK_INTERVAL_SECONDS)
 
         except requests.exceptions.RequestException:
-            logging.info("Rinnovo token sessione...")
+            logging.info("Rinnovo sessione Vinted...")
             try:
                 session = initialize_vinted_session(Config.vinted_url)
             except Exception:
