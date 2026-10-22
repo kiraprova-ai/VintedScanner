@@ -19,41 +19,49 @@ queries = [
     {
         'search_text': 'scuffers',
         'order': 'newest_first',
-        'page': 1
+        'page': 1,
+        'per_page': 20
     },
     {
         'search_text': 'reaven',
         'order': 'newest_first',
-        'page': 1
+        'page': 1,
+        'per_page': 20
     },
     {
         'search_text': 'fiveforufive',
         'order': 'newest_first',
-        'page': 1
+        'page': 1,
+        'per_page': 20
     },
     {
         'search_text': 'corvidae',
         'order': 'newest_first',
-        'page': 1
+        'page': 1,
+        'per_page': 20
     },
     {
         'search_text': 'perfect',
         'order': 'newest_first',
-        'page': 1
+        'page': 1,
+        'per_page': 20
     },
     {
         'search_text': 'ebtm',
         'order': 'newest_first',
-        'page': 1
+        'page': 1,
+        'per_page': 20
     },
     {
         'search_text': '5mc2',
         'order': 'newest_first',
-        'page': 1
+        'page': 1,
+        'per_page': 20
     },
     {
         'search_text': 'deputy department',
         'order': 'newest_first',
-        'page': 1
+        'page': 1,
+        'per_page': 20
     }
 ]
