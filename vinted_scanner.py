@@ -5,6 +5,7 @@ import email.utils
 import html
 import json
 import logging
+import os
 import re
 import smtplib
 import sys
@@ -18,17 +19,12 @@ import requests
 
 import Config
 
-# Webhook instradati tramite proxy per evitare rate-limit IP e revoche di sicurezza
-BRAND_WEBHOOKS = {
-    "scuffers": "https://webhook.lewisakura.moe/api/webhooks/1562802268435382374/Byn_ZtsbWdD1o4Rh1a9acl_hcv2OtMlVJmKIQNPIIqtBje8gRRyvmiB305coxn6Mb0QL/slack",
-    "reaven": "https://webhook.lewisakura.moe/api/webhooks/1562768580750090260/iDRYBS4r2RQO1K-ZnuYXVemKKT_zxcj16_lzRIrHFkz1yvmatF5o6C2gbzgEHsdDbszr/slack",
-    "fivefourfive": "https://webhook.lewisakura.moe/api/webhooks/1562768783297216572/0ophTnzbWiBbzyqMXW41Tko5PlADLn3mN-_L7Ay0Rql9l_4QseNs24YhdC9tfq4sUAjc/slack",
-    "corvidae": "https://webhook.lewisakura.moe/api/webhooks/1562768921059401732/174iHhaQSIea1PXB5Dt5bUDKv7HXRsaKPsvQyj0rKkIKheOIUg7nw_JTQ74199TL3GgT/slack",
-    "perfect": "https://webhook.lewisakura.moe/api/webhooks/1562769028878176287/3Ts4QjnGuhNxoxPOUxcIXdXAO_JW30ewPPP8lEgmRU0T9XySCKm3RwC_ckMrfmf53c_R/slack",
-    "ebtm": "https://webhook.lewisakura.moe/api/webhooks/1562769178195394694/tDN20DDfPNU3Y3Zm7pr0D5rBFEezct4o3u5z00E6iPprALzC4VtvbckV1P_V7owAzWOt/slack",
-    "5mc2": "https://webhook.lewisakura.moe/api/webhooks/1562769327118094376/mjwFLPWjffWjI8Hm-33wXspwL6LoOlOy0ZdC6dnRqkV4zSjiZiOxrGSVQHorrIADGuRE/slack",
-    "deputy department": "https://webhook.lewisakura.moe/api/webhooks/1562802075203666031/42k70jAGrUOC2DWdQC3wSV3DDmTNH8LHNntT-cqGUz6zOfdTt5Kl_-zPihH2-wKvVLkW/slack",
-}
+# Caricamento sicuro dei webhook dalla variabile d'ambiente di Render
+raw_webhooks = os.environ.get("DISCORD_WEBHOOKS_JSON", "{}")
+try:
+    BRAND_WEBHOOKS = json.loads(raw_webhooks)
+except Exception:
+    BRAND_WEBHOOKS = {}
 
 PROJECT_DIR = Path(__file__).resolve().parent
 ITEMS_DATABASE_PATH = PROJECT_DIR / "vinted_items.txt"
@@ -131,25 +127,25 @@ def save_analyzed_item(item_id, database_path=ITEMS_DATABASE_PATH):
         database.write(f"{item_id}\n")
 
 
-def send_slack_message(item_title, item_price, item_url, item_image, brand_title=None, matched_query=None):
+def send_discord_notification(item_title, item_price, item_url, item_image, brand_title=None, matched_query=None):
     webhook_url = BRAND_WEBHOOKS.get(str(matched_query).lower().strip())
-    if not webhook_url:
-        webhook_url = getattr(Config, "slack_webhook_url", "")
-
     if not webhook_url:
         return True
 
-    brand_display = brand_title if brand_title else matched_query
-    message_lines = [
-        f"*{item_title}*",
-        f"🏷️ **Prezzo:** {item_price}",
-        f"👕 **Brand:** {brand_display}",
-        f"🔗 {item_url}"
-    ]
-    if item_image:
-        message_lines.append(f"📷 {item_image}")
+    # Rimuove il suffisso legacy se presente
+    webhook_url = webhook_url.removesuffix("/slack")
 
-    payload = {"text": "\n".join(message_lines)}
+    brand_display = brand_title if brand_title else matched_query
+    content = (
+        f"**{item_title}**\n"
+        f"🏷️ **Prezzo:** {item_price}\n"
+        f"👕 **Brand:** {brand_display}\n"
+        f"🔗 {item_url}"
+    )
+    if item_image:
+        content += f"\n{item_image}"
+
+    payload = {"content": content}
 
     for attempt in range(2):
         try:
@@ -158,9 +154,9 @@ def send_slack_message(item_title, item_price, item_url, item_image, brand_title
             if response.status_code == 429:
                 try:
                     data = response.json()
-                    wait_time = float(data.get("retry_after", 3))
+                    wait_time = float(data.get("retry_after", 2))
                 except Exception:
-                    wait_time = float(response.headers.get("Retry-After", 3))
+                    wait_time = float(response.headers.get("Retry-After", 2))
 
                 if wait_time > 5.0:
                     logging.warning("Rate limit prolungato su [%s] (%.1f sec). Salto per sicurezza.", matched_query, wait_time)
@@ -172,7 +168,7 @@ def send_slack_message(item_title, item_price, item_url, item_image, brand_title
 
             response.raise_for_status()
             logging.info("Notifica inviata per [%s]: %s", matched_query, item_title)
-            time.sleep(1.5)
+            time.sleep(1.0)
             return True
 
         except requests.exceptions.RequestException as error:
@@ -253,7 +249,7 @@ def process_item(item, analyzed_items, is_initial_run=False, matched_query=None)
     if is_initial_run:
         return True
 
-    return send_slack_message(
+    return send_discord_notification(
         normalized["title"],
         normalized["price"],
         normalized["url"],
