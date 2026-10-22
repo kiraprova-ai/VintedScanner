@@ -27,7 +27,7 @@ CHECK_INTERVAL_SECONDS = 6
 # Scarta categoricamente annunci più vecchi di 10 minuti (600 secondi)
 MAX_ITEM_AGE_SECONDS = 600
 
-# Filtri specifici per il brand 'Perfect'
+# Filtri specifici per esclusioni e abbigliamento per 'Perfect'
 PERFECT_PAROLE_ESCLUSE = {
     "cap", "hat", "gorro", "gorra", "cappello", "berretto", "beanie",
     "gloves", "guanti", "guantes", "gants",
@@ -238,7 +238,7 @@ def normalize_item(item, enforce_age_check=True):
     if item_id is None or not item_title or not item_url:
         return None
 
-    # Controllo orario rigido: scarta tutto ciò che ha più di 10 minuti
+    # Controllo orario rigido: scarta annunci sopra i 10 minuti
     if enforce_age_check:
         created_at = item.get("created_at_ts")
         if not created_at and isinstance(item.get("photo"), dict):
@@ -285,9 +285,12 @@ def normalize_item(item, enforce_age_check=True):
 
 
 def is_relevant_item(item, search_text):
-    target = search_text.lower().strip()
-    title = item["title"].lower().replace("ü", "u")
-    brand = item["brand"].lower().strip().replace("ü", "u")
+    target = search_text.lower().strip().replace("ü", "u").replace("ú", "u").replace("ù", "u")
+    raw_title = item["title"].lower()
+    raw_brand = item["brand"].lower().strip()
+
+    title = raw_title.replace("ü", "u").replace("ú", "u").replace("ù", "u")
+    brand = raw_brand.replace("ü", "u").replace("ú", "u").replace("ù", "u")
 
     # Match 545 / FiveFourFive
     if "545" in target or "five" in target:
@@ -297,31 +300,39 @@ def is_relevant_item(item, search_text):
             return True
         return False
 
-    # Filtro mirato per 'Perfect' (esclude cibo per gatti, cover, fit, ecc.)
+    # Filtro 'Perfect'
     if target == "perfect":
-        # 1. Scarta categoricamente Perfect Fit o marchi non pertinenti
         if "perfect fit" in brand or "perfectfit" in brand:
             return False
 
         words = set(re.findall(r"\b\w+\b", title))
-        # 2. Scarta accessori indesiderati
         if any(bad in words for bad in PERFECT_PAROLE_ESCLUSE):
             return False
 
-        # 3. Se il brand inserito dal venditore è proprio "perfect", controlliamo che non sia un accessorio vietato
         if brand == "perfect":
             return True
 
-        # 4. Se è nel titolo, deve contenere "perfect" isolato E un tipo di capo d'abbigliamento
         has_perfect = bool(re.search(r"\bperfect\b", title))
         has_apparel = any(c in words or c in title for c in PERFECT_PAROLE_VESTITI)
         return has_perfect and has_apparel
 
-    # Stussy / Stüssy
-    if target in ("stussy", "stüssy"):
-        return "stussy" in brand or bool(re.search(r"\bstussy\b", title))
+    # Filtro rigoroso Supreme
+    if target == "supreme":
+        if brand == "supreme":
+            return True
+        if brand not in ("", "n/d", "senza marca", "vintage", "altro"):
+            return False
+        return bool(re.search(r"\bsupreme\b", title))
 
-    # Regola generale per Supreme, Scuffers, Corvidae, ecc.
+    # Filtro rigoroso Stüssy / Stussy
+    if target in ("stussy", "stüssy"):
+        if "stussy" in brand:
+            return True
+        if brand not in ("", "n/d", "senza marca", "vintage", "altro"):
+            return False
+        return bool(re.search(r"\bstussy\b", title))
+
+    # Regola generale (Scuffers, Corvidae, ecc.)
     if target in brand or target in title:
         return True
 
@@ -349,7 +360,7 @@ def main():
     if anon_id:
         api_headers["X-Anon-Id"] = anon_id
 
-    # WARMUP: memorizza le prime due pagine (40 annunci per brand) per blindare la memoria all'avvio
+    # WARMUP: scarica le prime 2 pagine per brand per archiviare l'esistente
     logging.info("--- AVVIO WARMUP: Archiviazione annunci pre-esistenti ---")
     for q in Config.queries:
         for page in (1, 2):
@@ -368,7 +379,7 @@ def main():
 
     logging.info("--- WARMUP CONCLUSO: %d annunci memorizzati. Solo drop <10 min da adesso! ---", len(analyzed_items))
 
-    # LOOP DI SCANSIONE CONTINUO
+    # LOOP DI MONITORAGGIO REAL-TIME
     while True:
         try:
             for q in Config.queries:
@@ -387,21 +398,21 @@ def main():
                     continue
 
                 for raw in items:
-                    # 1. Controllo orario (< 10 minuti)
+                    # 1. Filtro orario (< 10 minuti)
                     item = normalize_item(raw, enforce_age_check=True)
                     if not item:
                         continue
 
                     item_id = item["id"]
 
-                    # 2. Controllo duplicati: se già registrato, skip immediato
+                    # 2. Controllo duplicati
                     if item_id in analyzed_items:
                         continue
 
                     analyzed_items.add(item_id)
                     save_analyzed_item(item_id)
 
-                    # 3. Filtro pertinenza (Perfect fit escluso, solo tute/capi validi, ecc.)
+                    # 3. Filtri di pertinenza (Supreme, Stussy, Perfect, 545, ecc.)
                     if is_relevant_item(item, search_text):
                         logging.info("🔥 DROP RILEVATO: %s (Brand: %s)", item["title"], item["brand"])
                         if webhook_url:
