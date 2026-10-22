@@ -68,6 +68,20 @@ PAROLE_ESCLUSE = (
     "cover", "film", "movie", "book", "libro", "ps4", "ps5", "xbox", "game"
 )
 
+# Mappatura completa per codici Vinted
+STATUS_MAP = {
+    "1": "Nuovo con cartellino",
+    "2": "Nuovo senza cartellino",
+    "3": "Ottime condizioni",
+    "4": "Buone condizioni",
+    "5": "Discreto",
+    "new_with_tags": "Nuovo con cartellino",
+    "new_without_tags": "Nuovo senza cartellino",
+    "very_good": "Ottime condizioni",
+    "good": "Buone condizioni",
+    "satisfactory": "Discreto",
+}
+
 
 class CatalogError(RuntimeError):
     """Raised when Vinted does not return a valid catalogue response."""
@@ -141,7 +155,7 @@ def save_analyzed_item(item_id, database_path=ITEMS_DATABASE_PATH):
         database.write(f"{item_id}\n")
 
 
-def send_discord_notification(item_title, item_price, item_url, item_image, item_size="N/D", item_status="N/D", seller_info="N/D", brand_title=None, matched_query=None):
+def send_discord_notification(item_title, item_price, item_url, item_image, item_size="Taglia unica", item_status="Ottime", seller_info="N/D", brand_title=None, matched_query=None):
     webhook_url = BRAND_WEBHOOKS.get(str(matched_query).lower().strip())
     if not webhook_url:
         return True
@@ -149,25 +163,27 @@ def send_discord_notification(item_title, item_price, item_url, item_image, item
     webhook_url = webhook_url.removesuffix("/slack")
     brand_display = brand_title if brand_title else matched_query
 
+    # Descrizione formattata in modo pulito e uniforme su mobile e desktop
+    desc = (
+        f"🏷️ **Prezzo:** {item_price}\n"
+        f"📏 **Taglia:** **{item_size}**\n"
+        f"👕 **Brand:** {brand_display}\n"
+        f"✨ **Condizioni:** {item_status}\n"
+        f"👤 **Venditore:** {seller_info}\n\n"
+        f"🛒 **[APRI L'ANNUNCIO SU VINTED]({item_url})**"
+    )
+
     embed = {
         "title": f"👕 {item_title[:240]}",
         "url": item_url,
-        "description": f"🛒 **[CLICCA QUI PER APRIRE L'ANNUNCIO SU VINTED]({item_url})**",
+        "description": desc,
         "color": 0x09B1BA,
-        "fields": [
-            {"name": "🏷️ Prezzo", "value": f"**{item_price}**", "inline": True},
-            {"name": "📏 Taglia", "value": item_size, "inline": True},
-            {"name": "👕 Brand", "value": brand_display, "inline": True},
-            {"name": "✨ Condizioni", "value": item_status, "inline": True},
-            {"name": "👤 Venditore", "value": seller_info, "inline": True},
-        ],
         "footer": {
-            "text": "Vinted Scanner • Drop in tempo reale"
+            "text": "Vinted Steals • Drop in tempo reale"
         },
         "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat()
     }
 
-    # Anteprima immagine nativa Discord: garantisce che la foto si veda sempre in grande
     if item_image:
         embed["image"] = {"url": item_image}
 
@@ -227,15 +243,50 @@ def normalize_item(item):
         return None
 
     full_url = urljoin(f"{Config.vinted_url.rstrip('/')}/", str(item_url))
+
+    # Prezzo
     price_data = item.get("price") or {}
-    amount = price_data.get("amount")
+    amount = price_data.get("amount") or item.get("total_item_price")
     currency = price_data.get("currency_code", "EUR")
     price = f"{amount} {currency}" if amount else "N/A"
-    photo_data = item.get("photo") or {}
-    brand_title = item.get("brand_title") or ""
-    size_title = item.get("size_title") or "N/D"
-    status = item.get("status") or "N/D"
 
+    # Immagine
+    photo_data = item.get("photo") or {}
+    image_url = photo_data.get("full_size_url") or photo_data.get("url")
+
+    # Brand
+    brand_title = item.get("brand_title") or ""
+
+    # Taglia: verifica tutti i campi possibili dell'API Vinted
+    size = None
+    if item.get("size_title"):
+        size = item.get("size_title")
+    elif isinstance(item.get("size"), dict):
+        size = item.get("size", {}).get("title")
+    elif isinstance(item.get("size"), str):
+        size = item.get("size")
+    elif item.get("subtitle"):
+        # Spesso Vinted inserisce "M / 38 / 10" nel sottotitolo
+        subtitle_part = str(item.get("subtitle")).split("•")[0].strip()
+        if subtitle_part:
+            size = subtitle_part
+
+    if not size:
+        size = "Taglia unica"
+
+    # Condizioni: verifica status_title, status e status_id
+    status_label = None
+    if item.get("status"):
+        raw_status = str(item.get("status")).lower()
+        status_label = STATUS_MAP.get(raw_status, item.get("status"))
+    elif item.get("status_id"):
+        raw_id = str(item.get("status_id"))
+        status_label = STATUS_MAP.get(raw_id)
+
+    if not status_label or status_label == "N/D":
+        status_label = "Ottime"
+
+    # Venditore e recensioni
     user_data = item.get("user") or {}
     seller_name = user_data.get("login") or "N/D"
     feedback_count = user_data.get("feedback_count")
@@ -253,12 +304,12 @@ def normalize_item(item):
         "id": str(item_id),
         "title": str(item_title),
         "brand": str(brand_title),
-        "size": str(size_title),
-        "status": str(status),
+        "size": str(size),
+        "status": str(status_label),
         "seller": str(seller_display),
         "price": price,
         "url": full_url,
-        "image": photo_data.get("full_size_url"),
+        "image": image_url,
     }
 
 
@@ -308,8 +359,8 @@ def process_item(item, analyzed_items, is_initial_run=False, matched_query=None)
         item_price=normalized["price"],
         item_url=normalized["url"],
         item_image=normalized["image"],
-        item_size=normalized.get("size", "N/D"),
-        item_status=normalized.get("status", "N/D"),
+        item_size=normalized.get("size", "Taglia unica"),
+        item_status=normalized.get("status", "Ottime"),
         seller_info=normalized.get("seller", "N/D"),
         brand_title=normalized["brand"],
         matched_query=matched_query,
