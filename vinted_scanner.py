@@ -154,24 +154,7 @@ def save_analyzed_item(item_id, database_path=ITEMS_DATABASE_PATH):
         database.write(f"{item_id}\n")
 
 
-def fetch_item_details(session, marketplace_url, item_id, api_headers):
-    """Estrae i dati specifici del capo per taglia e condizioni esatte."""
-    parsed_url = urlsplit(marketplace_url)
-    hostname = parsed_url.hostname or "vinted.it"
-    if hostname.startswith("www."):
-        hostname = hostname[4:]
-    endpoint = f"https://www.{hostname}/api/v2/items/{item_id}"
-    
-    try:
-        resp = session.get(endpoint, headers=api_headers, timeout=10)
-        if resp.status_code == 200:
-            return resp.json().get("item", {})
-    except Exception:
-        pass
-    return {}
-
-
-def send_discord_notification(item_title, item_price, item_url, item_image, item_size="Taglia unica", item_status="Ottime condizioni", seller_info="N/D", brand_title=None, matched_query=None):
+def send_discord_notification(item_title, item_price, item_url, item_image, item_status="Ottime condizioni", seller_info="N/D", brand_title=None, matched_query=None):
     webhook_url = BRAND_WEBHOOKS.get(str(matched_query).lower().strip())
     if not webhook_url:
         return True
@@ -181,7 +164,6 @@ def send_discord_notification(item_title, item_price, item_url, item_image, item
 
     desc = (
         f"🏷️ **Prezzo:** {item_price}\n"
-        f"📏 **Taglia:** **{item_size}**\n"
         f"👕 **Brand:** {brand_display}\n"
         f"✨ **Condizioni:** {item_status}\n"
         f"👤 **Venditore:** {seller_info}\n\n"
@@ -250,7 +232,7 @@ def get_catalog_items(session, catalog_url, params, api_headers):
         raise CatalogError(f"Catalogue request error: {error}") from error
 
 
-def normalize_item(item, detail=None):
+def normalize_item(item):
     item_id = item.get("id")
     item_title = item.get("title")
     item_url = item.get("url")
@@ -259,51 +241,24 @@ def normalize_item(item, detail=None):
 
     full_url = urljoin(f"{Config.vinted_url.rstrip('/')}/", str(item_url))
 
-    # Prezzo
     price_data = item.get("price") or {}
     amount = price_data.get("amount") or item.get("total_item_price")
     currency = price_data.get("currency_code", "EUR")
     price = f"{amount} {currency}" if amount else "N/A"
 
-    # Immagine
     photo_data = item.get("photo") or {}
     image_url = photo_data.get("full_size_url") or photo_data.get("url")
 
-    # Brand
-    brand_title = item.get("brand_title") or (detail.get("brand_dto", {}).get("title") if detail else "")
+    brand_title = item.get("brand_title") or ""
 
-    # Taglia
-    size = None
-    if detail:
-        size = detail.get("size_title") or detail.get("size")
-    if not size:
-        size = item.get("size_title")
-    if not size and isinstance(item.get("size"), dict):
-        size = item.get("size", {}).get("title")
-    if not size and isinstance(item.get("size"), str):
-        size = item.get("size")
-    if not size and item.get("subtitle"):
-        size = str(item.get("subtitle")).split("•")[0].strip()
-
-    if not size:
-        size = "Taglia unica"
-
-    # Condizioni
     status_label = None
-    if detail:
-        status_label = detail.get("status")
-        if not status_label:
-            raw_id = str(detail.get("status_id") or "").lower()
-            status_label = STATUS_MAP.get(raw_id)
-    if not status_label:
-        raw_status = str(item.get("status_id") or item.get("status") or "").lower()
-        status_label = STATUS_MAP.get(raw_status, item.get("status"))
+    raw_status = str(item.get("status_id") or item.get("status") or "").lower()
+    status_label = STATUS_MAP.get(raw_status, item.get("status"))
 
     if not status_label or status_label == "N/D":
         status_label = "Ottime condizioni"
 
-    # Venditore e feedback
-    user_data = item.get("user") or (detail.get("user") if detail else {}) or {}
+    user_data = item.get("user") or {}
     seller_name = user_data.get("login") or "N/D"
     feedback_count = user_data.get("feedback_count")
     feedback_reputation = user_data.get("feedback_reputation")
@@ -320,7 +275,6 @@ def normalize_item(item, detail=None):
         "id": str(item_id),
         "title": str(item_title),
         "brand": str(brand_title),
-        "size": str(size),
         "status": str(status_label),
         "seller": str(seller_display),
         "price": price,
@@ -334,7 +288,6 @@ def is_relevant_item(normalized, query_text):
     title = normalized["title"].lower().replace("ü", "u")
     brand = normalized["brand"].lower().strip().replace("ü", "u")
 
-    # Logica per Perfect (come prima, senza blocchi su altri brand)
     if target == "perfect":
         if "perfect" in brand:
             return True
@@ -347,7 +300,6 @@ def is_relevant_item(normalized, query_text):
         has_clothing_term = any(c in words or c in title for c in PAROLE_VESTITI)
         return has_perfect_word and has_clothing_term
 
-    # Logica per Stussy
     if target in ("stussy", "stüssy"):
         return "stussy" in brand or bool(re.search(r"\bstussy\b", title))
 
@@ -358,37 +310,18 @@ def is_relevant_item(normalized, query_text):
     return bool(re.search(pattern, title))
 
 
-def process_item(item, analyzed_items, session=None, api_headers=None, is_initial_run=False, matched_query=None):
-    item_id = str(item.get("id"))
-    if not item_id or item_id in analyzed_items:
+def process_item(item, analyzed_items, is_initial_run=False, matched_query=None):
+    normalized = normalize_item(item)
+    if not normalized or normalized["id"] in analyzed_items:
         return True
 
-    save_analyzed_item(item_id)
-    analyzed_items.add(item_id)
+    save_analyzed_item(normalized["id"])
+    analyzed_items.add(normalized["id"])
 
-    title_pre = str(item.get("title", "")).lower().replace("ü", "u")
-    brand_pre = str(item.get("brand_title", "")).lower().replace("ü", "u")
-    target = matched_query.lower().strip()
-
-    if target == "perfect":
-        if "perfect" not in title_pre and "perfect" not in brand_pre:
-            return True
-    elif target in ("stussy", "stüssy"):
-        if "stussy" not in brand_pre and "stussy" not in title_pre:
-            return True
-    elif target not in brand_pre and not re.search(rf"\b{re.escape(target)}\b", title_pre):
+    if not is_relevant_item(normalized, matched_query):
         return True
 
     if is_initial_run:
-        return True
-
-    # Chiamata di dettaglio per avere taglia e condizioni reali
-    detail = {}
-    if session and api_headers:
-        detail = fetch_item_details(session, Config.vinted_url, item_id, api_headers)
-
-    normalized = normalize_item(item, detail=detail)
-    if not normalized or not is_relevant_item(normalized, matched_query):
         return True
 
     return send_discord_notification(
@@ -396,7 +329,6 @@ def process_item(item, analyzed_items, session=None, api_headers=None, is_initia
         item_price=normalized["price"],
         item_url=normalized["url"],
         item_image=normalized["image"],
-        item_size=normalized.get("size", "Taglia unica"),
         item_status=normalized.get("status", "Ottime condizioni"),
         seller_info=normalized.get("seller", "N/D"),
         brand_title=normalized["brand"],
@@ -433,8 +365,6 @@ def main():
                         process_item(
                             item,
                             analyzed_items,
-                            session=session,
-                            api_headers=api_headers,
                             is_initial_run=is_initial_run,
                             matched_query=matched_brand,
                         )
