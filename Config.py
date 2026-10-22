@@ -8,8 +8,8 @@ smtp_toaddrs = []
 slack_webhook_url = ""
 
 # Telegram Token and ChatID for notification
-telegram_bot_token = "8593224934:AAEGg8RZPc62NaqIoYCNoryODTYGM-ljRN0"
-telegram_chat_id = "1104636752"
+telegram_bot_token = ""
+telegram_chat_id = ""
 
 # Vinted URL
 vinted_url = "https://www.vinted.it"
@@ -39,6 +39,13 @@ queries = [
     },
     {
         "search_text": "fivefourfive",
+        "page": 1,
+        "per_page": 20,
+        "order": "newest_first",
+        "filters": {},
+    },
+    {
+        "search_text": "545",
         "page": 1,
         "per_page": 20,
         "order": "newest_first",
@@ -109,3 +116,4 @@ queries = [
     },
 ]
 
+SEARCH_QUERIES = queries
