@@ -149,11 +149,10 @@ def send_discord_notification(item_title, item_price, item_url, item_image, item
     webhook_url = webhook_url.removesuffix("/slack")
     brand_display = brand_title if brand_title else matched_query
 
-    # Scheda completa con dettagli ordinati
     embed = {
-        "title": item_title[:250],
+        "title": f"👕 {item_title[:240]}",
         "url": item_url,
-        "description": f"🛒 **[CLICCA QUI PER VEDERE O ACQUISTARE]({item_url})**",
+        "description": f"🛒 **[CLICCA QUI PER APRIRE L'ANNUNCIO SU VINTED]({item_url})**",
         "color": 0x09B1BA,
         "fields": [
             {"name": "🏷️ Prezzo", "value": f"**{item_price}**", "inline": True},
@@ -168,10 +167,11 @@ def send_discord_notification(item_title, item_price, item_url, item_image, item
         "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat()
     }
 
-    # Se c'è l'immagine, la inviamo come content sopra la scheda per averla in cima
-    payload = {"embeds": [embed]}
+    # Anteprima immagine nativa Discord: garantisce che la foto si veda sempre in grande
     if item_image:
-        payload["content"] = item_image
+        embed["image"] = {"url": item_image}
+
+    payload = {"embeds": [embed]}
 
     for attempt in range(2):
         try:
