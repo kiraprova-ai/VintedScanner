@@ -33,7 +33,7 @@ PROJECT_DIR = Path(__file__).resolve().parent
 ITEMS_DATABASE_PATH = PROJECT_DIR / "vinted_items.txt"
 LOG_PATH = PROJECT_DIR / "vinted_scanner.log"
 REQUEST_TIMEOUT_SECONDS = 30
-CHECK_INTERVAL_SECONDS = 60
+CHECK_INTERVAL_SECONDS = 30  # Ridotto a 30s per catturare i drop ancora più velocemente
 
 WEB_HEADERS = {
     "User-Agent": (
@@ -57,40 +57,11 @@ WEB_HEADERS = {
     "Cache-Control": "no-cache",
 }
 
-LEGACY_QUERY_KEYS = {
-    "brand_ids",
-    "catalog_ids",
-    "color_ids",
-    "material_ids",
-    "size_ids",
-    "status_ids",
-}
-
-CATALOG_QUERY_KEYS = {
-    "currency",
-    "filters",
-    "order",
-    "page",
-    "per_page",
-    "price_from",
-    "price_to",
-    "search_text",
-}
-
-CATALOG_ORDER_VALUES = {
-    "newest_first",
-    "price_high_to_low",
-    "price_low_to_high",
-    "relevance",
-}
-
-
 class CatalogError(RuntimeError):
     """Raised when Vinted does not return a valid catalogue response."""
 
 
 def configure_logging():
-    """Configure a rotating log file relative to this script."""
     handler = RotatingFileHandler(
         LOG_PATH,
         maxBytes=5_000_000,
@@ -103,40 +74,17 @@ def configure_logging():
     )
 
 
-def parse_arguments():
-    """Parse command-line options."""
-    parser = argparse.ArgumentParser(
-        description="Search Vinted for new items and send notifications."
-    )
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="show new items without sending notifications",
-    )
-    return parser.parse_args()
-
-
 def build_catalog_url(marketplace_url):
-    """Build the country-specific catalogue API URL."""
     parsed_url = urlsplit(marketplace_url)
     hostname = parsed_url.hostname
-
-    if parsed_url.scheme != "https" or not hostname:
-        raise ValueError("vinted_url must be a valid HTTPS URL")
-
+    if not hostname:
+        raise ValueError("URL Vinted non valido")
     if hostname.startswith("www."):
         hostname = hostname[4:]
-
-    if not hostname.startswith("vinted."):
-        raise ValueError("vinted_url must point to a Vinted marketplace")
-
-    return urlunsplit(
-        ("https", f"api.{hostname}", "/svc-catalogue/items", "", "")
-    )
+    return urlunsplit(("https", f"api.{hostname}", "/svc-catalogue/items", "", ""))
 
 
 def build_api_headers(marketplace_url):
-    """Return headers for the Vinted web catalogue API."""
     marketplace_url = marketplace_url.rstrip("/")
     api_headers = {
         "User-Agent": WEB_HEADERS["User-Agent"],
@@ -147,52 +95,41 @@ def build_api_headers(marketplace_url):
         "Origin": marketplace_url,
         "Referer": f"{marketplace_url}/",
     }
-
     locale = getattr(Config, "vinted_locale", None)
     if locale:
         api_headers["Locale"] = locale
-
     return api_headers
 
 
 def build_catalog_params(query):
-    """Validate a configured query and convert its filters to API parameters."""
-    if not isinstance(query, dict):
-        raise ValueError("each entry in queries must be a dictionary")
-
     for required_key in ("page", "per_page", "order", "filters"):
         if required_key not in query:
             raise ValueError(f"missing required query key: {required_key}")
 
-    filters = query["filters"]
     params = {
         key: value
         for key, value in query.items()
         if key != "filters" and value not in (None, "")
     }
-    for filter_code, filter_ids in filters.items():
+    for filter_code, filter_ids in query["filters"].items():
         normalized_ids = [str(filter_id) for filter_id in filter_ids]
         if normalized_ids:
             params[f"attribute_ids[{filter_code}]"] = ",".join(normalized_ids)
-
     return params
 
 
 def load_analyzed_items(database_path=ITEMS_DATABASE_PATH):
-    """Load item IDs, creating the local database if it does not exist."""
     database_path.touch(exist_ok=True)
     with database_path.open("r", encoding="utf-8", errors="ignore") as database:
         return {line.strip() for line in database if line.strip()}
 
 
 def save_analyzed_item(item_id, database_path=ITEMS_DATABASE_PATH):
-    """Append an item ID to the local database."""
     with database_path.open("a", encoding="utf-8") as database:
         database.write(f"{item_id}\n")
 
 
-def send_slack_message(item_title, item_price, item_url, item_image, matched_query=None):
-    """Send Discord/Slack notification to the specific brand webhook."""
+def send_slack_message(item_title, item_price, item_url, item_image, brand_title=None, matched_query=None):
     webhook_url = BRAND_WEBHOOKS.get(str(matched_query).lower().strip())
     if not webhook_url:
         webhook_url = getattr(Config, "slack_webhook_url", "")
@@ -200,10 +137,13 @@ def send_slack_message(item_title, item_price, item_url, item_image, matched_que
     if not webhook_url:
         return True
 
-    message_lines = [f"*{item_title}*", f"🏷️ {item_price}"]
-    if matched_query:
-        message_lines.append(f"🔍 Brand: {matched_query}")
-    message_lines.append(f"🔗 {item_url}")
+    brand_display = brand_title if brand_title else matched_query
+    message_lines = [
+        f"*{item_title}*",
+        f"🏷️ **Prezzo:** {item_price}",
+        f"👕 **Brand:** {brand_display}",
+        f"🔗 {item_url}"
+    ]
     if item_image:
         message_lines.append(f"📷 {item_image}")
 
@@ -214,15 +154,14 @@ def send_slack_message(item_title, item_price, item_url, item_image, matched_que
             timeout=REQUEST_TIMEOUT_SECONDS,
         )
         response.raise_for_status()
-        logging.info("Discord notification sent for [%s]", matched_query)
+        logging.info("Discord inviato per [%s]: %s", matched_query, item_title)
         return True
     except requests.exceptions.RequestException as error:
-        logging.error("Error sending Slack notification: %s", error)
+        logging.error("Errore invio notifica Discord: %s", error)
         return False
 
 
 def get_catalog_items(session, catalog_url, params, api_headers):
-    """Return catalogue items or raise CatalogError for an invalid response."""
     try:
         response = session.get(
             catalog_url,
@@ -238,7 +177,6 @@ def get_catalog_items(session, catalog_url, params, api_headers):
 
 
 def normalize_item(item):
-    """Normalize item details."""
     item_id = item.get("id")
     item_title = item.get("title")
     item_url = item.get("url")
@@ -251,39 +189,55 @@ def normalize_item(item):
     currency = price_data.get("currency_code", "EUR")
     price = f"{amount} {currency}" if amount else "N/A"
     photo_data = item.get("photo") or {}
+    
+    brand_title = item.get("brand_title") or ""
 
     return {
         "id": str(item_id),
-        "title": item_title,
+        "title": str(item_title),
+        "brand": str(brand_title),
         "price": price,
         "url": full_url,
         "image": photo_data.get("full_size_url"),
     }
 
 
-def process_item(item, analyzed_items, dry_run, is_initial_run=False, matched_query=None):
-    """Process item: register it, but notify only after initial sync."""
+def is_relevant_item(normalized, query_text):
+    """Verifica che la parola ricercata sia realmente nel Brand o nel Titolo"""
+    target = query_text.lower().strip()
+    title = normalized["title"].lower()
+    brand = normalized["brand"].lower()
+    
+    # Se il brand coincide esattamente o la parola chiave è presente nel titolo o nel brand dell'annuncio
+    return (target in brand) or (target in title)
+
+
+def process_item(item, analyzed_items, is_initial_run=False, matched_query=None):
     normalized = normalize_item(item)
     if not normalized or normalized["id"] in analyzed_items:
         return True
 
-    # Se e' il primo avvio, memorizza senza inviare notifiche spam
+    # FILTRO ANTI-SPAM: scarta i risultati casuali (es. "perfect condition")
+    if not is_relevant_item(normalized, matched_query):
+        save_analyzed_item(normalized["id"])
+        analyzed_items.add(normalized["id"])
+        return True
+
+    # Se è il primo avvio, memorizza silenziosamente
     if is_initial_run:
         save_analyzed_item(normalized["id"])
         analyzed_items.add(normalized["id"])
         return True
 
-    if dry_run:
-        print(f"[DRY-RUN] {normalized['title']} - {normalized['price']}")
-        succeeded = True
-    else:
-        succeeded = send_slack_message(
-            normalized["title"],
-            normalized["price"],
-            normalized["url"],
-            normalized["image"],
-            matched_query,
-        )
+    # Notifica in tempo reale
+    succeeded = send_slack_message(
+        normalized["title"],
+        normalized["price"],
+        normalized["url"],
+        normalized["image"],
+        brand_title=normalized["brand"],
+        matched_query=matched_query,
+    )
 
     if succeeded:
         save_analyzed_item(normalized["id"])
@@ -292,24 +246,23 @@ def process_item(item, analyzed_items, dry_run, is_initial_run=False, matched_qu
 
 
 def initialize_vinted_session(marketplace_url):
-    """Initialize session."""
     session = requests.Session()
     session.get(marketplace_url, headers=WEB_HEADERS, timeout=REQUEST_TIMEOUT_SECONDS)
     return session
 
 
-def main(dry_run=False):
+def main():
     configure_logging()
     catalog_url = build_catalog_url(Config.vinted_url)
     queries = [build_catalog_params(q) for q in Config.queries]
     api_headers = build_api_headers(Config.vinted_url)
     analyzed_items = load_analyzed_items()
 
-    logging.info("Avvio sessione Vinted...")
+    logging.info("Inizializzazione sessione Vinted...")
     session = initialize_vinted_session(Config.vinted_url)
 
     is_initial_run = True
-    logging.info("Scanner avviato. Modalità: Sincronizzazione iniziale silenziosa...")
+    logging.info("Sincronizzazione iniziale degli annunci attuali in corso...")
 
     while True:
         try:
@@ -321,32 +274,30 @@ def main(dry_run=False):
                         process_item(
                             item,
                             analyzed_items,
-                            dry_run,
                             is_initial_run=is_initial_run,
                             matched_query=matched_brand,
                         )
                 except CatalogError as err:
-                    logging.warning("Errore interrogazione [%s]: %s", matched_brand, err)
-                    time.sleep(2)
+                    logging.warning("Errore richiesta per [%s]: %s", matched_brand, err)
+                    time.sleep(1)
 
             if is_initial_run:
                 is_initial_run = False
-                logging.info("Sincronizzazione completata! Da adesso solo nuovi drop in tempo reale.")
+                logging.info("Sincronizzazione completata! Filtro anti-spam attivo, in attesa di nuovi drop reali.")
 
             time.sleep(CHECK_INTERVAL_SECONDS)
 
         except requests.exceptions.RequestException:
-            logging.info("Rinnovamento sessione...")
+            logging.info("Rinnovo token sessione...")
             try:
                 session = initialize_vinted_session(Config.vinted_url)
             except Exception:
                 pass
-            time.sleep(15)
+            time.sleep(10)
         except Exception as error:
-            logging.error("Errore imprevisto nel ciclo: %s", error)
+            logging.error("Errore ciclo principale: %s", error)
             time.sleep(CHECK_INTERVAL_SECONDS)
 
 
 if __name__ == "__main__":
-    arguments = parse_arguments()
-    sys.exit(main(dry_run=arguments.dry_run))
+    sys.exit(main())
