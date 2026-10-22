@@ -24,10 +24,10 @@ LOG_PATH = PROJECT_DIR / "vinted_scanner.log"
 REQUEST_TIMEOUT_SECONDS = 25
 CHECK_INTERVAL_SECONDS = 6
 
-# Filtro rigido a 5 minuti (300 secondi): annunci più vecchi vengono scartati all'istante
+# Soglia massima: 5 minuti (300 secondi)
 MAX_ITEM_AGE_SECONDS = 300
 
-# Parole escluse per il brand 'Perfect' (no accessori non voluti)
+# Parole escluse per il brand 'Perfect'
 PERFECT_PAROLE_ESCLUSE = {
     "cap", "hat", "gorro", "gorra", "cappello", "berretto", "beanie",
     "gloves", "guanti", "guantes", "gants",
@@ -35,7 +35,6 @@ PERFECT_PAROLE_ESCLUSE = {
     "cover", "custodia", "case", "scarpe", "shoes", "sneakers"
 }
 
-# Parole chiave d'abbigliamento per 'Perfect' (tute, felpe, giacche, pantaloni)
 PERFECT_PAROLE_VESTITI = {
     "tuta", "tracksuit", "chandal", "survetement",
     "hoodie", "hoodies", "felpa", "felpe", "sweatshirt", "sudadera",
@@ -229,28 +228,43 @@ def get_catalog_items(session, catalog_url, params, api_headers):
     return items
 
 
-def get_item_real_age_seconds(session, item_id):
-    """Interroga direttamente i dettagli del capo per calcolare l'orario effettivo di caricamento."""
-    try:
-        url = f"https://www.vinted.it/api/v2/items/{item_id}"
-        resp = session.get(url, headers=WEB_HEADERS, timeout=8)
-        if resp.status_code == 200:
-            data = resp.json().get("item", {})
-            created_at = data.get("created_at_ts")
-            if not created_at and "created_at" in data:
-                raw_date = data.get("created_at")
-                if isinstance(raw_date, str):
-                    try:
+def extract_item_age_seconds(raw_item, session):
+    """Calcola con esattezza l'età del capo. Se non è verificabile, restituisce 999999 per scartarlo."""
+    now_ts = int(datetime.now(timezone.utc).timestamp())
+
+    # 1. Prova dai metadati del catalogo
+    ts = raw_item.get("created_at_ts")
+    if not ts and isinstance(raw_item.get("photo"), dict):
+        ts = raw_item.get("photo", {}).get("high_resolution", {}).get("timestamp")
+
+    if ts:
+        try:
+            return now_ts - int(ts)
+        except Exception:
+            pass
+
+    # 2. Se manca, interroga la scheda capo con sessione autenticata
+    item_id = raw_item.get("id")
+    if session and item_id:
+        try:
+            url = f"{Config.vinted_url.rstrip('/')}/api/v2/items/{item_id}"
+            headers = build_api_headers(Config.vinted_url)
+            resp = session.get(url, headers=headers, timeout=6)
+            if resp.status_code == 200:
+                data = resp.json().get("item", {})
+                created_at = data.get("created_at_ts")
+                if not created_at and "created_at" in data:
+                    raw_date = data.get("created_at")
+                    if isinstance(raw_date, str):
                         dt = datetime.fromisoformat(raw_date.replace("Z", "+00:00"))
                         created_at = int(dt.timestamp())
-                    except Exception:
-                        pass
-            if created_at:
-                now_ts = int(datetime.now(timezone.utc).timestamp())
-                return now_ts - int(created_at)
-    except Exception as exc:
-        logging.debug("Impossibile recuperare timestamp dettagliato per item %s: %s", item_id, exc)
-    return None
+                if created_at:
+                    return now_ts - int(created_at)
+        except Exception:
+            pass
+
+    # Se non c'è prova matematica che sia nuovo, viene considerato vecchio
+    return 999_999
 
 
 def normalize_item(item):
@@ -342,7 +356,7 @@ def is_relevant_item(item, search_text):
             return False
         return bool(re.search(r"\bstussy\b", title))
 
-    # Regola generale (Scuffers, Corvidae, ecc.)
+    # Regola generale (EBTM, Corvidae, Reaven, Scuffers)
     if target in brand or target in title:
         return True
 
@@ -387,9 +401,9 @@ def main():
                 logging.warning("[%s - pag %d] Errore warmup: %s", search_text, page, exc)
             time.sleep(0.3)
 
-    logging.info("--- WARMUP CONCLUSO: %d annunci in archivio. Monitoraggio drop attivi avviato! ---", len(analyzed_items))
+    logging.info("--- WARMUP CONCLUSO: %d annunci archiviati. Monitoraggio attivo! ---", len(analyzed_items))
 
-    # LOOP REAL-TIME
+    # LOOP IN TEMPO REALE
     while True:
         try:
             for q in Config.queries:
@@ -400,7 +414,7 @@ def main():
                 try:
                     items = get_catalog_items(session, catalog_url, params, api_headers)
                 except Exception as err:
-                    logging.warning("[%s] Errore API: %s. Refresh sessione...", search_text, err)
+                    logging.warning("[%s] Errore chiamata: %s. Refresh sessione...", search_text, err)
                     session = initialize_vinted_session(Config.vinted_url)
                     anon_id = session.cookies.get("anon_id")
                     if anon_id:
@@ -414,21 +428,21 @@ def main():
 
                     item_id = item["id"]
 
-                    # 1. Se l'ID è già stato visto, skip
+                    # 1. Se già visto o processato, skip
                     if item_id in analyzed_items:
                         continue
 
-                    # Archivia subito per non ricontrollarlo
+                    # Archivia subito per non riprocessarlo mai più
                     analyzed_items.add(item_id)
                     save_analyzed_item(item_id)
 
-                    # 2. Controllo pertinenza (brand, parole escluse, filtri)
+                    # 2. Controllo pertinenza
                     if not is_relevant_item(item, search_text):
                         continue
 
-                    # 3. VERIFICA RIGIDA DELL'ETÀ REALE DELL'ANNUNCIO (Massimo 5 minuti / 300 secondi)
-                    age_seconds = get_item_real_age_seconds(session, item_id)
-                    if age_seconds is not None and age_seconds > MAX_ITEM_AGE_SECONDS:
+                    # 3. VERIFICA RIGIDA DELL'ETÀ: Se > 300 secondi o non certificabile, CESTINA!
+                    age_seconds = extract_item_age_seconds(raw, session)
+                    if age_seconds > MAX_ITEM_AGE_SECONDS:
                         logging.info("Scartato annuncio vecchio (%d sec fa): %s", age_seconds, item["title"])
                         continue
 
