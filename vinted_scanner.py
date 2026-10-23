@@ -256,6 +256,7 @@ def normalize_item(item):
 
     return {
         "id": str(item_id),
+        "numeric_id": int(item_id) if str(item_id).isdigit() else 0,
         "title": item_title,
         "brand": brand_title,
         "price": item_price,
@@ -342,26 +343,34 @@ def main():
     if anon_id:
         api_headers["X-Anon-Id"] = anon_id
 
-    # WARMUP ROBUSTO: Scarica le prime 2 pagine di catalogo (40 articoli) per ogni brand
-    # Tutti gli articoli esistenti prima dell'avvio vengono archiviati
-    logging.info("--- AVVIO WARMUP: Archiviazione annunci pre-esistenti ---")
-    for q in Config.queries:
-        for page in (1, 2):
-            params, channel_key = build_catalog_params(q, page=page)
-            search_text = params.get("search_text", channel_key)
-            try:
-                items = get_catalog_items(session, catalog_url, params, api_headers)
-                for raw in items:
-                    raw_id = raw.get("id")
-                    if raw_id:
-                        item_id = str(raw_id)
-                        analyzed_items.add(item_id)
-                        save_analyzed_item(item_id)
-            except Exception as exc:
-                logging.warning("[%s - pag %d] Errore warmup: %s", search_text, page, exc)
-            time.sleep(0.3)
+    # ID GLOBALE MASSIMO: su Vinted gli ID sono progressivi su tutta la piattaforma.
+    # Prendiamo l'ID più recente in assoluto all'avvio per bloccare qualsiasi articolo vecchio su tutti i canali.
+    global_min_valid_id = 0
 
-    logging.info("--- WARMUP COMPLETATO: %d annunci in memoria. In ascolto per nuovi drop... ---", len(analyzed_items))
+    logging.info("--- AVVIO ANCORAGGIO GLOBALE: Registrazione annunci esistenti ---")
+    for q in Config.queries:
+        params, channel_key = build_catalog_params(q, page=1)
+        search_text = params.get("search_text", channel_key)
+        try:
+            items = get_catalog_items(session, catalog_url, params, api_headers)
+            for raw in items:
+                raw_id = raw.get("id")
+                if raw_id:
+                    item_id = str(raw_id)
+                    analyzed_items.add(item_id)
+                    save_analyzed_item(item_id)
+                    if item_id.isdigit():
+                        num_id = int(item_id)
+                        if num_id > global_min_valid_id:
+                            global_min_valid_id = num_id
+        except Exception as exc:
+            logging.warning("[%s] Errore ancoraggio warmup: %s", search_text, exc)
+        time.sleep(0.4)
+
+    logging.info(
+        "--- WARMUP COMPLETATO: Sbarramento globale fissato all'ID %d. Solo annunci nuovi da questo istante! ---",
+        global_min_valid_id,
+    )
 
     # LOOP DI SCANSIONE IN TEMPO REALE
     while True:
@@ -386,25 +395,36 @@ def main():
                     if not raw_id:
                         continue
                     item_id = str(raw_id)
+                    numeric_id = int(item_id) if item_id.isdigit() else 0
 
-                    # Se l'annuncio era già presente (nel warmup o nei cicli scorsi), ignoralo
+                    # 1. Se l'ID è già stato visto, salta subito
                     if item_id in analyzed_items:
                         continue
 
-                    # Archivia immediatamente l'ID in modo che non venga mai più notificato
                     analyzed_items.add(item_id)
                     save_analyzed_item(item_id)
 
-                    # Normalizza l'annuncio
+                    # 2. SBARRAMENTO GLOBALE ANTI-VECCHI:
+                    # Se l'ID numerico è inferiore o uguale all'ID globale registrato all'avvio del bot,
+                    # l'articolo è stato caricato PRIMA dell'accensione del bot: scartalo!
+                    if global_min_valid_id > 0 and numeric_id <= global_min_valid_id:
+                        logging.info(
+                            "[%s] Scartato annuncio pre-esistente (ID %d <= %d)",
+                            channel_key, numeric_id, global_min_valid_id
+                        )
+                        continue
+
                     item = normalize_item(raw)
                     if not item:
                         continue
 
-                    # Verifica i filtri di pertinenza (Perfect fit escluso, solo tute, brand corretti)
-                    if is_relevant_item(item, search_text):
-                        logging.info("🔥 DROP REALE RILEVATO: %s (Brand: %s)", item["title"], item["brand"])
-                        if webhook_url:
-                            send_discord_notification(webhook_url, item)
+                    # 3. Filtri di pertinenza (Perfect fit escluso, solo tute, brand precisi)
+                    if not is_relevant_item(item, search_text):
+                        continue
+
+                    logging.info("🔥 DROP REALE IN DIRETTA: %s (Brand: %s - ID: %d)", item["title"], item["brand"], numeric_id)
+                    if webhook_url:
+                        send_discord_notification(webhook_url, item)
 
                 time.sleep(0.4)
 
