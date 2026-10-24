@@ -33,7 +33,7 @@ LOG_PATH = PROJECT_DIR / "vinted_scanner.log"
 
 REQUEST_TIMEOUT_SECONDS = 10          # ricerche su Vinted e invii a Discord
 SESSION_INIT_TIMEOUT_SECONDS = 25     # apertura sessione (pagine più pesanti)
-CHECK_INTERVAL_SECONDS = getattr(Config, "check_interval_seconds", 3)
+CHECK_INTERVAL_SECONDS = getattr(Config, "check_interval_seconds", 5)
 MAX_WORKERS = getattr(Config, "max_workers", 3)
 DEFAULT_PER_PAGE = getattr(Config, "default_per_page", 30)
 SESSION_MAX_AGE_SECONDS = 30 * 60
@@ -447,8 +447,6 @@ def post_webhook(webhook_url, payload):
 
 
 def build_embed(item, note=None):
-    buy_url = f"{Config.vinted_url.rstrip('/')}/transaction/buy/new?source_item_id={item['id']}"
-
     lines = [
         f"🏷️ **Prezzo:** {item['price']}",
         f"👕 **Brand:** {item['brand']}",
@@ -464,7 +462,6 @@ def build_embed(item, note=None):
         lines.append(f"🔎 *{note}*")
     lines.append("")
     lines.append(f"🛒 **[APRI L'ANNUNCIO SU VINTED]({item['url']})**")
-    lines.append(f"⚡ **[ACQUISTA SUBITO (CHECKOUT)]({buy_url})**")
 
     embed = {
         "title": f"👕 {item['title']}"[:250],
