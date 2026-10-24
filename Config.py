@@ -21,9 +21,9 @@ default_per_page = 30
 
 # --- Webhook Discord (opzionale) --------------------------------
 # Il bot legge i webhook dalle variabili d'ambiente DISCORD_WEBHOOKS_JSON
-# e DISCORD_WEBHOOK_URL. Se preferisci, puoi incollarli qui.
+# e DISCORD_WEBHOOK_URL (come prima). Se preferisci, puoi incollarli qui.
 # La chiave deve essere uguale al "channel" del brand. Non condividere questo file
-# con nessuno se ci scrivi dentro i webhook reali.
+# con nessuno se ci scrivi dentro i webhook.
 webhooks = {
     # "scuffers": "https://discord.com/api/webhooks/...",
 }
@@ -43,6 +43,12 @@ webhooks = {
 # require_words  (solo per match dal titolo) serve almeno una di queste parole
 # ignore_phrases frasi da ignorare nel titolo (es. "perfect condition")
 # per_page       (facoltativo) quanti annunci leggere per questo brand
+# loose          (facoltativo) True = manda anche gli annunci che Vinted trova con la
+#                ricerca ma dove il nome NON è nel titolo né nella marca (di solito è
+#                scritto nella descrizione). Arrivano col colore ARANCIONE e una nota
+#                "da verificare". Va bene per nomi rari (scuffers, reaven...), NON per
+#                nomi comuni (perfect, supreme). Se arrivano troppi annunci inutili,
+#                metti False oppure cancella la riga.
 # brand_ids      (avanzato, facoltativo) ID della marca su Vinted: aggiunge una
 #                ricerca che pesca tutti gli annunci con quella marca,
 #                anche se il titolo non la nomina. L'ID si vede nell'URL
@@ -78,16 +84,19 @@ BRANDS = [
         "channel": "scuffers",
         "searches": ["scuffers"],
         "names": ["scuffers"],
+        "loose": True,
     },
     {
         "channel": "reaven",
         "searches": ["reaven"],
         "names": ["reaven"],
+        "loose": True,
     },
     {
         "channel": "corvidae",
         "searches": ["corvidae"],
         "names": ["corvidae"],
+        "loose": True,
     },
     {
         "channel": "fivefourfive",
@@ -99,6 +108,7 @@ BRANDS = [
         "channel": "5mc2",
         "searches": ["5mc2"],
         "names": ["5mc2", "5 mc 2"],
+        "loose": True,
     },
     {
         "channel": "perfect",
@@ -113,6 +123,7 @@ BRANDS = [
         "channel": "ebtm",
         "searches": ["ebtm"],
         "names": ["ebtm"],
+        "loose": True,
     },
     {
         "channel": "deputy department",
