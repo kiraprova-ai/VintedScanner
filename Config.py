@@ -10,8 +10,8 @@ vinted_locale = "it-IT"
 # --- Velocità --------------------------------------------------
 # Secondi di pausa tra un giro completo di controlli e il successivo.
 # Più basso = notifiche più veloci, ma se esageri Vinted può bloccarti.
-# Se nei log vedi spesso "429" o "troppe richieste", alza questo numero (5 o 8).
-check_interval_seconds = 3
+# Se nei log vedi spesso "429" o "troppe richieste", alza questo numero (8 o 10).
+check_interval_seconds = 5
 
 # Quante ricerche su Vinted partono insieme (2-4 va bene).
 max_workers = 3
